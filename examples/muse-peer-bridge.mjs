@@ -22,7 +22,7 @@ import {
 } from './lib/brain-adapter.mjs';
 
 const HEARTBEAT_MS = 20_000;
-const INITIAL_RECONNECT_MS = 1_500;
+const INITIAL_RECONNECT_MS = 800;
 const MAX_RECONNECT_MS = 30_000;
 const CHAT_COOLDOWN_MS = 45_000;
 
@@ -96,12 +96,16 @@ export function createPeerBridgeClient({ peer, wsUrl, token, env, announceOnBoot
 
     console.log(`[${peer.id}] Tugas masuk (${taskId}): ${title}`);
     send('task:accept', { taskId }, `accept-${peer.id}-${taskId}`);
-    send('bot:status', {
-      status: 'working',
-      zone: peer.homeZone,
-      taskId,
-      speech: `Mengerjakan: ${String(title || 'tugas').slice(0, 60)}`,
-    });
+    send(
+      'bot:status',
+      {
+        status: 'working',
+        zone: peer.homeZone,
+        taskId,
+        speech: `Mengerjakan: ${String(title || 'tugas').slice(0, 60)}`,
+      },
+      `status-work-${peer.id}-${taskId}`
+    );
 
     try {
       const outcome = await executeForPeer({
@@ -136,8 +140,8 @@ export function createPeerBridgeClient({ peer, wsUrl, token, env, announceOnBoot
             `delegate-${peer.id}-${taskId}-${idx}`
           );
         }
-        // Ensure child tasks are recorded before completing coordinator task
-        await new Promise((r) => setTimeout(r, 150));
+        // Brief flush yield so child tasks are recorded before completing coordinator task
+        await new Promise((r) => setTimeout(r, 40));
       }
 
       send(
@@ -292,7 +296,10 @@ export function createPeerBridgeClient({ peer, wsUrl, token, env, announceOnBoot
       if (ws === socket) ws = null;
       if (!stopped) {
         const isAuthClose =
-          evt.code === 4001 || authRejected || /unauthorized/i.test(evt.reason || '');
+          evt.code === 4001 ||
+          evt.code === 4003 ||
+          authRejected ||
+          /unauthorized|forbidden/i.test(evt.reason || '');
         if (isAuthClose) {
           console.error(`[${peer.id}] Auth gagal (WS ${evt.code || 4001}): ${AUTH_RETRY_MESSAGE}`);
           scheduleReconnect(true);

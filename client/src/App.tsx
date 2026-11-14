@@ -24,6 +24,8 @@ import { RightPanel } from './components/RightPanel';
 import { SettingsModal } from './components/SettingsModal';
 import { useMuseSocket } from './hooks/useMuseSocket';
 import { LLMProvider, Mission } from './types';
+import { playUiCue } from './utils/soundEffects';
+import { cleanDisplayText } from './utils/textClean';
 
 export default function App() {
   const {
@@ -76,7 +78,9 @@ export default function App() {
   const isRunningMission = missions.some((m) => m.status === 'running');
 
   const showError = (msg: string) => {
-    setToastError(msg);
+    playUiCue('error');
+    const cleaned = cleanDisplayText(msg, { stripMarkdown: true, singleLine: true });
+    setToastError(cleaned || 'Terjadi kesalahan');
     setTimeout(() => setToastError(null), 4000);
   };
 
@@ -343,6 +347,7 @@ SESSION_SECRET=<string-acak-32-karakter>`}
           <OfficeCanvas
             agents={agents}
             beams={beams}
+            tasks={tasks}
             selectedAgentId={selectedAgentId}
             onSelectAgent={(id) => {
               setSelectedAgentId(id);
@@ -356,6 +361,7 @@ SESSION_SECRET=<string-acak-32-karakter>`}
             agents={agents}
             onLaunchMission={handleLaunchMission}
             isRunningMission={isRunningMission}
+            selectedAgentId={selectedAgentId}
           />
 
           {agents.length === 0 && !dismissEmptyGuide && (
@@ -402,15 +408,15 @@ SESSION_SECRET=<string-acak-32-karakter>`}
           )}
 
           {toastError && (
-            <div className="absolute top-14 left-1/2 z-30 -translate-x-1/2 rounded-xl border border-rose-500/50 bg-rose-950/90 px-4 py-2 text-xs font-medium text-rose-200 shadow-xl backdrop-blur-md">
-              {toastError}
+            <div className="absolute top-14 left-1/2 z-30 max-w-md -translate-x-1/2 rounded-xl border border-rose-500/50 bg-rose-950/90 px-4 py-2 text-xs font-medium text-rose-200 shadow-xl backdrop-blur-md">
+              {cleanDisplayText(toastError, { stripMarkdown: true, singleLine: true })}
             </div>
           )}
         </main>
 
         {/* Right Docked Comms / Tasks / Inspector Panel */}
         {panelOpen && (
-          <div className="h-full w-80 shrink-0 sm:w-96 xl:w-[410px]">
+          <div className="h-full w-80 shrink-0 sm:w-[400px] xl:w-[450px]">
             <RightPanel
               agents={agents}
               missions={missions}

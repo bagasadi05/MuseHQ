@@ -5,6 +5,11 @@
  */
 
 import {
+  sanitizeCleanText,
+  sanitizeSpeechText,
+  sanitizeTitleText,
+} from './lib/brain-adapter.mjs';
+import {
   AUTH_RETRY_MESSAGE,
   computeAuthBackoffMs,
   resolveBridgeToken,
@@ -60,7 +65,7 @@ function connect() {
 
     setTimeout(() => {
       send('bot:speech', {
-        text: `Halo tim! ${BOT_NAME} (${BOT_ID}) online di ${BOT_HOME_ZONE} via WebSocket.`,
+        text: sanitizeSpeechText(`Halo tim, ${BOT_NAME} (${BOT_ID}) online di ${BOT_HOME_ZONE} via WebSocket.`),
       });
     }, 1200);
 
@@ -93,11 +98,19 @@ function connect() {
       if (processedTaskIds.has(taskId)) return;
       processedTaskIds.add(taskId);
 
+      const cleanTitle = sanitizeTitleText(String(title || 'Tugas Eksternal')) || 'Tugas Eksternal';
+      const cleanInstructions = sanitizeCleanText(String(instructions || ''), {
+        singleLine: true,
+        stripMarkdown: true,
+      }).slice(0, 160);
+      const cleanBotName =
+        sanitizeCleanText(BOT_NAME, { singleLine: true, stripMarkdown: true }) || BOT_ID;
+
       send('task:accept', { taskId }, `ws-accept-${BOT_ID}-${taskId}`);
       send('bot:status', {
         status: 'working',
         zone: BOT_HOME_ZONE,
-        speech: `Memproses "${title}" melalui WebSocket worker...`,
+        speech: sanitizeSpeechText(`Memproses "${cleanTitle}" melalui WebSocket worker...`),
       });
 
       setTimeout(() => {
@@ -105,15 +118,15 @@ function connect() {
           'task:complete',
           {
             taskId,
-            speech: `Tugas "${title}" selesai dari proses eksternal!`,
+            speech: sanitizeSpeechText(`Tugas "${cleanTitle}" selesai dari proses eksternal.`),
             result: [
-              `#### Hasil Eksekusi Bot Eksternal (${BOT_NAME})`,
+              `### Hasil Eksekusi Bot Eksternal (${cleanBotName})`,
               `**ID Agen:** \`${BOT_ID}\``,
-              `**Tugas:** ${title}`,
-              `**Ringkasan Instruksi:** ${String(instructions || '').slice(0, 160)}`,
+              `**Tugas:** ${cleanTitle}`,
+              `**Ringkasan Instruksi:** ${cleanInstructions || '-'}`,
               '',
               '- Diproses secara real-time oleh worker eksternal melalui `/ws/bot`.',
-              '- Bridge dua arah aktif (siap disambungkan ke Telegram/Discord/n8n/Python).',
+              '- Bridge dua arah aktif untuk integrasi layanan eksternal.',
             ].join('\n'),
           },
           `ws-complete-${BOT_ID}-${taskId}`
@@ -136,10 +149,12 @@ function connect() {
         (payload.kind === 'chat' || payload.kind === 'command') &&
         !content.startsWith('Pesan diterima dari ')
       ) {
+        const cleanSender = sanitizeCleanText(String(payload.fromName || payload.fromId), { singleLine: true });
+        const cleanSnippet = sanitizeCleanText(content, { singleLine: true }).slice(0, 80);
         send(
           'bot:speech',
           {
-            text: `Pesan diterima dari ${payload.fromName || payload.fromId}: "${content.slice(0, 80)}"`,
+            text: sanitizeSpeechText(`Pesan diterima dari ${cleanSender}: "${cleanSnippet}"`),
             toId: payload.fromId,
           },
           `ws-reply-${BOT_ID}-${payload.id || Date.now()}`

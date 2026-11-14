@@ -24,29 +24,52 @@ class HttpAuthError extends Error {
   }
 }
 
-/** Creates a REST mailbox client reporting `brainMode: "muse-langsung"` with 401 backoff. */
-export function createMailboxClient({ baseUrl, botId, token, peer, pollMs = 3000 }) {
+/** Creates a REST mailbox client reporting `brainMode: "muse-langsung"` with long-poll & 401 backoff. */
+export function createMailboxClient({
+  baseUrl,
+  botId,
+  token,
+  peer,
+  pollMs = 3000,
+  waitMs = 18_000,
+}) {
   const cleanUrl = baseUrl.replace(/\/+$/, '');
+  const rawWait = Number(waitMs);
+  const defaultWaitMs = Number.isFinite(rawWait)
+    ? Math.min(20_000, Math.max(0, Math.floor(rawWait)))
+    : 18_000;
+  const idlePollMs = Math.max(50, Number(pollMs) || 3000);
   let cursor = 0;
   let running = false;
+  let stopped = false;
   let registered = false;
   let timer = null;
   let resolveSleep = null;
+  let activeController = null;
 
   const requestJson = async (apiPath, options = {}) => {
-    const res = await fetch(`${cleanUrl}${apiPath}`, {
-      ...options,
-      headers: {
-        'Content-Type': 'application/json',
-        'x-muse-token': token,
-        ...(options.headers || {}),
-      },
-    });
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      throw new HttpAuthError(res.status, `HTTP ${res.status} pada ${apiPath}: ${body.slice(0, 180)}`);
+    const controller = new AbortController();
+    activeController = controller;
+    try {
+      const res = await fetch(`${cleanUrl}${apiPath}`, {
+        ...options,
+        signal: controller.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          'x-muse-token': token,
+          ...(options.headers || {}),
+        },
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        throw new HttpAuthError(res.status, `HTTP ${res.status} pada ${apiPath}: ${body.slice(0, 180)}`);
+      }
+      return res.json();
+    } finally {
+      if (activeController === controller) {
+        activeController = null;
+      }
     }
-    return res.json();
   };
 
   const sendEvent = (event, payload = {}, eventId) =>
@@ -75,13 +98,27 @@ export function createMailboxClient({ baseUrl, botId, token, peer, pollMs = 3000
     console.log(`[${botId}] Kotak surat aktif di ${cleanUrl} (brainMode=muse-langsung).`);
   };
 
-  const pollMailboxOnce = async () => {
+  const pollMailboxOnce = async (overrideWaitMs) => {
     if (!registered) {
       await hello();
     }
-    const inbox = await requestJson(
-      `/api/bridge/bots/${encodeURIComponent(botId)}/events?since=${cursor}`
-    );
+    const reqWaitMs =
+      overrideWaitMs !== undefined && Number.isFinite(Number(overrideWaitMs))
+        ? Math.min(20_000, Math.max(0, Math.floor(Number(overrideWaitMs))))
+        : defaultWaitMs;
+    const query = `since=${cursor}${reqWaitMs > 0 ? `&waitMs=${reqWaitMs}` : ''}`;
+    let inbox;
+    try {
+      inbox = await requestJson(`/api/bridge/bots/${encodeURIComponent(botId)}/events?${query}`);
+    } catch (err) {
+      if (err instanceof HttpAuthError && err.status === 404 && !stopped) {
+        registered = false;
+        await hello();
+        inbox = await requestJson(`/api/bridge/bots/${encodeURIComponent(botId)}/events?${query}`);
+      } else {
+        throw err;
+      }
+    }
     if (typeof inbox.cursor === 'number' && inbox.cursor > cursor) {
       cursor = inbox.cursor;
     }
@@ -91,7 +128,17 @@ export function createMailboxClient({ baseUrl, botId, token, peer, pollMs = 3000
     for (const task of inbox.pendingTasks || []) {
       console.log(`[${botId}] Tugas menunggu di kotak surat [${task.id}]: ${task.title}`);
     }
-    await sendEvent('bot:heartbeat', {});
+    if (!stopped) {
+      try {
+        await sendEvent('bot:heartbeat', {});
+      } catch (err) {
+        if (err instanceof HttpAuthError && err.status === 404) {
+          registered = false;
+        } else {
+          throw err;
+        }
+      }
+    }
     return inbox;
   };
 
@@ -101,34 +148,49 @@ export function createMailboxClient({ baseUrl, botId, token, peer, pollMs = 3000
     pollMailboxOnce,
     async startLoop() {
       running = true;
+      stopped = false;
       let authAttempt = 0;
-      while (running) {
-        let waitMs = pollMs;
+      while (running && !stopped) {
+        let nextSleepMs = idlePollMs;
+        const startedAt = Date.now();
         try {
-          await pollMailboxOnce();
+          const inbox = await pollMailboxOnce();
           authAttempt = 0;
+          const elapsedMs = Date.now() - startedAt;
+          const hasEvents = Boolean(inbox?.events?.length);
+          if (hasEvents || (defaultWaitMs > 0 && elapsedMs >= Math.min(1000, defaultWaitMs))) {
+            nextSleepMs = 40;
+          }
         } catch (err) {
+          if (stopped || !running || err?.name === 'AbortError') {
+            break;
+          }
           if (err instanceof HttpAuthError && err.status === 401) {
-            waitMs = computeAuthBackoffMs(authAttempt);
+            nextSleepMs = computeAuthBackoffMs(authAttempt);
             authAttempt += 1;
-            console.error(`[${botId}] HTTP 401: ${AUTH_RETRY_MESSAGE} (retry ${waitMs}ms)`);
+            console.error(`[${botId}] HTTP 401: ${AUTH_RETRY_MESSAGE} (retry ${nextSleepMs}ms)`);
           } else {
             console.error(`[${botId}] Gagal cek kotak surat:`, err?.message || err);
           }
         }
-        if (!running) break;
+        if (!running || stopped) break;
         await new Promise((resolve) => {
           resolveSleep = resolve;
           timer = setTimeout(() => {
             timer = null;
             resolveSleep = null;
             resolve();
-          }, waitMs);
+          }, nextSleepMs);
         });
       }
     },
     stop() {
+      stopped = true;
       running = false;
+      if (activeController) {
+        activeController.abort();
+        activeController = null;
+      }
       if (timer) {
         clearTimeout(timer);
         timer = null;

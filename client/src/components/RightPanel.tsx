@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
+  ArrowRight,
   Ban,
   Bot,
   Check,
@@ -31,6 +32,7 @@ import {
   ZoneId,
 } from '../types';
 import { getAgentBrainBadge } from '../utils/brainBadge';
+import { cleanDisplayText, stripUniqueSymbols } from '../utils/textClean';
 import { MarkdownView } from './MarkdownView';
 
 interface RightPanelProps {
@@ -59,6 +61,8 @@ interface RightPanelProps {
 }
 
 type TabId = 'comms' | 'tasks' | 'deliverables' | 'inspector';
+type CommsFilterId = 'all' | 'chat-command' | 'system-delegation';
+type TaskFilterId = 'all' | 'active' | 'done';
 
 const STATUS_BADGES: Record<string, { label: string; cls: string }> = {
   queued: { label: 'Antre', cls: 'bg-slate-700/70 text-slate-300' },
@@ -78,6 +82,64 @@ const STATUS_BADGES: Record<string, { label: string; cls: string }> = {
   failed: { label: 'Gagal', cls: 'bg-rose-500/20 text-rose-300' },
 };
 
+const MISSION_STATUS_META: Record<Mission['status'], { label: string; cls: string }> = {
+  running: { label: 'Berjalan', cls: 'bg-amber-500/20 text-amber-300' },
+  completed: { label: 'Selesai', cls: 'bg-emerald-500/20 text-emerald-300' },
+  failed: { label: 'Gagal', cls: 'bg-rose-500/20 text-rose-300' },
+};
+
+interface CommsCategoryMeta {
+  label: string;
+  cardCls: string;
+  pillCls: string;
+  group: Exclude<CommsFilterId, 'all'>;
+}
+
+const COMMS_CATEGORY_META: Record<CommsMessage['kind'], CommsCategoryMeta> = {
+  command: {
+    label: 'Perintah',
+    cardCls: 'border-amber-500/35 bg-amber-500/[0.07]',
+    pillCls: 'border-amber-500/40 bg-amber-500/15 text-amber-200',
+    group: 'chat-command',
+  },
+  chat: {
+    label: 'Obrolan',
+    cardCls: 'border-sky-500/30 bg-sky-500/[0.06]',
+    pillCls: 'border-sky-500/35 bg-sky-500/15 text-sky-200',
+    group: 'chat-command',
+  },
+  deliverable: {
+    label: 'Laporan',
+    cardCls: 'border-emerald-500/35 bg-emerald-500/[0.07]',
+    pillCls: 'border-emerald-500/40 bg-emerald-500/15 text-emerald-200',
+    group: 'chat-command',
+  },
+  delegation: {
+    label: 'Delegasi',
+    cardCls: 'border-violet-500/35 bg-violet-500/[0.07]',
+    pillCls: 'border-violet-500/40 bg-violet-500/15 text-violet-200',
+    group: 'system-delegation',
+  },
+  error: {
+    label: 'Peringatan',
+    cardCls: 'border-rose-500/40 bg-rose-500/[0.08]',
+    pillCls: 'border-rose-500/40 bg-rose-500/15 text-rose-200',
+    group: 'system-delegation',
+  },
+  progress: {
+    label: 'Info',
+    cardCls: 'border-slate-800 bg-slate-950/65',
+    pillCls: 'border-slate-700 bg-slate-800/80 text-slate-300',
+    group: 'system-delegation',
+  },
+  system: {
+    label: 'Info',
+    cardCls: 'border-slate-800 bg-slate-950/65',
+    pillCls: 'border-slate-700 bg-slate-800/80 text-slate-300',
+    group: 'system-delegation',
+  },
+};
+
 const CANCELLABLE_STATUSES = new Set([
   'queued',
   'waiting-dependency',
@@ -87,6 +149,73 @@ const CANCELLABLE_STATUSES = new Set([
   'in-progress',
   'stuck',
 ]);
+
+function cleanOneLine(text: string | undefined, fallback = ''): string {
+  if (!text) return fallback;
+  const cleaned = cleanDisplayText(text, { stripMarkdown: true, singleLine: true });
+  return cleaned || fallback;
+}
+
+function formatTimeHMS(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '--:--:--';
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  return `${hh}:${mm}:${ss}`;
+}
+
+function isTerminalTaskStatus(status: Task['status']): boolean {
+  return status === 'completed' || status === 'failed';
+}
+
+interface FilterOption<T extends string> {
+  id: T;
+  label: string;
+  count: number;
+}
+
+function FilterPillBar<T extends string>({
+  ariaLabel,
+  options,
+  value,
+  onChange,
+}: {
+  ariaLabel: string;
+  options: FilterOption<T>[];
+  value: T;
+  onChange: (next: T) => void;
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label={ariaLabel}>
+      {options.map((opt) => {
+        const active = value === opt.id;
+        return (
+          <button
+            key={opt.id}
+            type="button"
+            onClick={() => onChange(opt.id)}
+            aria-pressed={active}
+            className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium transition cursor-pointer ${
+              active
+                ? 'border-amber-400/60 bg-amber-500/15 text-amber-200'
+                : 'border-slate-800 bg-slate-950/70 text-slate-400 hover:border-slate-700 hover:text-slate-200'
+            }`}
+          >
+            <span>{opt.label}</span>
+            <span
+              className={`font-mono text-[10px] ${
+                active ? 'text-amber-300/90' : 'text-slate-500'
+              }`}
+            >
+              {opt.count}
+            </span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
 
 export const RightPanel: React.FC<RightPanelProps> = ({
   agents,
@@ -107,6 +236,8 @@ export const RightPanel: React.FC<RightPanelProps> = ({
   onResetWorkspace,
 }) => {
   const [tab, setTab] = useState<TabId>('comms');
+  const [commsFilter, setCommsFilter] = useState<CommsFilterId>('all');
+  const [taskFilter, setTaskFilter] = useState<TaskFilterId>('all');
   const [expandedTaskId, setExpandedTaskId] = useState<string | null>(null);
   const [reassignTargets, setReassignTargets] = useState<Record<string, string>>({});
   const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
@@ -150,6 +281,27 @@ export const RightPanel: React.FC<RightPanelProps> = ({
     .filter((t) => t.status === 'completed' && Boolean(t.result));
   const deliverablesCount = missionDeliverables.length + taskDeliverables.length;
 
+  const chatCommandCount = comms.filter(
+    (m) => (COMMS_CATEGORY_META[m.kind] || COMMS_CATEGORY_META.system).group === 'chat-command'
+  ).length;
+  const systemDelegationCount = comms.length - chatCommandCount;
+  const filteredComms =
+    commsFilter === 'all'
+      ? comms
+      : comms.filter(
+          (m) => (COMMS_CATEGORY_META[m.kind] || COMMS_CATEGORY_META.system).group === commsFilter
+        );
+
+  const activeTaskCount = tasks.filter((t) => !isTerminalTaskStatus(t.status)).length;
+  const doneTaskCount = tasks.length - activeTaskCount;
+  const orderedTasks = [...tasks].reverse();
+  const filteredTasks =
+    taskFilter === 'all'
+      ? orderedTasks
+      : taskFilter === 'active'
+        ? orderedTasks.filter((t) => !isTerminalTaskStatus(t.status))
+        : orderedTasks.filter((t) => isTerminalTaskStatus(t.status));
+
   const handleCopyMarkdown = (id: string, markdown: string) => {
     navigator.clipboard.writeText(markdown);
     setCopiedDeliverableId(id);
@@ -166,7 +318,7 @@ export const RightPanel: React.FC<RightPanelProps> = ({
         relayTo,
         relayText.trim(),
         relayAsTask,
-        relayAsTask ? `Order langsung` : undefined
+        relayAsTask ? 'Order langsung' : undefined
       );
       setRelayText('');
     } catch {
@@ -181,28 +333,22 @@ export const RightPanel: React.FC<RightPanelProps> = ({
       {/* Latest Mission Banner */}
       {latestMission && (
         <div className="border-b border-slate-800 bg-slate-950/60 px-4 py-3">
-          <div className="flex items-start justify-between gap-2">
-            <div className="min-w-0">
+          <div className="flex items-start justify-between gap-2.5">
+            <div className="min-w-0 flex-1">
               <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
-                <Activity className="h-3.5 w-3.5 text-amber-400" />
+                <Activity className="h-3.5 w-3.5 shrink-0 text-amber-400" />
                 <span>Misi Terbaru</span>
                 <span
                   className={`ml-1 rounded px-1.5 py-0.5 text-[10px] ${
-                    latestMission.status === 'running'
-                      ? 'bg-amber-500/20 text-amber-300'
-                      : latestMission.status === 'completed'
-                        ? 'bg-emerald-500/20 text-emerald-300'
-                        : 'bg-rose-500/20 text-rose-300'
+                    MISSION_STATUS_META[latestMission.status].cls
                   }`}
                 >
-                  {latestMission.status === 'running'
-                    ? 'Berjalan'
-                    : latestMission.status === 'completed'
-                      ? 'Selesai'
-                      : 'Gagal'}
+                  {MISSION_STATUS_META[latestMission.status].label}
                 </span>
               </div>
-              <p className="mt-1 line-clamp-2 text-xs text-slate-200">{latestMission.prompt}</p>
+              <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-slate-200">
+                {cleanOneLine(latestMission.prompt, 'Misi aktif')}
+              </p>
             </div>
             {latestMission.finalSummary && (
               <button
@@ -261,12 +407,13 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                       : a.status === 'offline' || a.status === 'error'
                         ? 'bg-rose-500'
                         : 'bg-sky-400';
+            const cleanName = stripUniqueSymbols(a.name) || a.name;
             return (
               <button
                 key={a.id}
                 type="button"
                 onClick={() => onSelectAgent(a.id)}
-                title={`${a.name} — ${a.role} (${a.status}) | Otak: ${brain.label}`}
+                title={`${cleanName} — ${a.role} (${a.status}) | Otak: ${brain.label}`}
                 className={`flex flex-wrap items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] transition cursor-pointer ${
                   selectedAgentId === a.id
                     ? 'border-amber-400/70 bg-amber-500/15 text-amber-100'
@@ -276,7 +423,7 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                 }`}
               >
                 <span className={`h-1.5 w-1.5 rounded-full ${dotCls}`} />
-                <span className="font-medium">{a.name}</span>
+                <span className="font-medium">{cleanName}</span>
                 <span className="font-mono text-[9px] text-slate-500">{a.status}</span>
                 <span className={`rounded border px-1.5 py-0.5 text-[9px] font-semibold ${brain.cls}`}>
                   {brain.label}
@@ -288,18 +435,18 @@ export const RightPanel: React.FC<RightPanelProps> = ({
       </div>
 
       {/* Navigation Tabs */}
-      <div className="flex items-center border-b border-slate-800 px-1.5 pt-2">
+      <div className="flex items-center border-b border-slate-800 px-1.5 pt-1.5">
         <button
           type="button"
           onClick={() => setTab('comms')}
-          className={`flex flex-1 items-center justify-center gap-1 border-b-2 px-2 py-2 text-xs font-semibold transition cursor-pointer ${
+          className={`flex flex-auto items-center justify-center gap-1.5 whitespace-nowrap border-b-2 px-2 py-2 text-[11px] sm:text-xs font-semibold transition cursor-pointer ${
             tab === 'comms'
               ? 'border-amber-400 text-amber-300'
               : 'border-transparent text-slate-400 hover:text-slate-200'
           }`}
         >
           <MessageSquare className="h-3.5 w-3.5 shrink-0" />
-          <span>Comms</span>
+          <span>Percakapan</span>
           <span className="rounded-full bg-slate-800 px-1.5 py-0.5 text-[10px] text-slate-400">
             {comms.length}
           </span>
@@ -308,7 +455,7 @@ export const RightPanel: React.FC<RightPanelProps> = ({
         <button
           type="button"
           onClick={() => setTab('tasks')}
-          className={`flex flex-1 items-center justify-center gap-1 border-b-2 px-2 py-2 text-xs font-semibold transition cursor-pointer ${
+          className={`flex flex-auto items-center justify-center gap-1.5 whitespace-nowrap border-b-2 px-2 py-2 text-[11px] sm:text-xs font-semibold transition cursor-pointer ${
             tab === 'tasks'
               ? 'border-amber-400 text-amber-300'
               : 'border-transparent text-slate-400 hover:text-slate-200'
@@ -324,7 +471,7 @@ export const RightPanel: React.FC<RightPanelProps> = ({
         <button
           type="button"
           onClick={() => setTab('deliverables')}
-          className={`flex flex-1 items-center justify-center gap-1 border-b-2 px-2 py-2 text-xs font-semibold transition cursor-pointer ${
+          className={`flex flex-auto items-center justify-center gap-1.5 whitespace-nowrap border-b-2 px-2 py-2 text-[11px] sm:text-xs font-semibold transition cursor-pointer ${
             tab === 'deliverables'
               ? 'border-amber-400 text-amber-300'
               : 'border-transparent text-slate-400 hover:text-slate-200'
@@ -340,7 +487,7 @@ export const RightPanel: React.FC<RightPanelProps> = ({
         <button
           type="button"
           onClick={() => setTab('inspector')}
-          className={`flex flex-1 items-center justify-center gap-1 border-b-2 px-2 py-2 text-xs font-semibold transition cursor-pointer ${
+          className={`flex flex-auto items-center justify-center gap-1.5 whitespace-nowrap border-b-2 px-2 py-2 text-[11px] sm:text-xs font-semibold transition cursor-pointer ${
             tab === 'inspector'
               ? 'border-amber-400 text-amber-300'
               : 'border-transparent text-slate-400 hover:text-slate-200'
@@ -352,10 +499,10 @@ export const RightPanel: React.FC<RightPanelProps> = ({
       </div>
 
       {/* Tab Content */}
-      <div className="min-h-0 flex-1 overflow-y-auto p-3">
+      <div className="min-h-0 flex-1 overflow-y-auto p-3.5">
         {tab === 'comms' && (
-          <div className="flex flex-col gap-2.5">
-            <div className="flex items-center justify-between">
+          <div className="flex flex-col gap-3">
+            <div className="flex items-center justify-between gap-2">
               <span className="text-[11px] font-medium text-slate-400">
                 Log Komunikasi & Delegasi Ruangan
               </span>
@@ -370,44 +517,68 @@ export const RightPanel: React.FC<RightPanelProps> = ({
               )}
             </div>
 
-            {comms.map((msg) => {
-              const badgeColor =
-                msg.kind === 'command'
-                  ? 'border-amber-500/40 bg-amber-500/10'
-                  : msg.kind === 'delegation'
-                    ? 'border-violet-500/40 bg-violet-500/10'
-                    : msg.kind === 'deliverable'
-                      ? 'border-emerald-500/35 bg-emerald-500/10'
-                      : msg.kind === 'error'
-                        ? 'border-rose-500/40 bg-rose-500/10'
-                        : 'border-slate-800 bg-slate-950/60';
+            <FilterPillBar
+              ariaLabel="Filter percakapan"
+              value={commsFilter}
+              onChange={setCommsFilter}
+              options={[
+                { id: 'all', label: 'Semua', count: comms.length },
+                { id: 'chat-command', label: 'Obrolan & Perintah', count: chatCommandCount },
+                {
+                  id: 'system-delegation',
+                  label: 'Sistem & Delegasi',
+                  count: systemDelegationCount,
+                },
+              ]}
+            />
 
-              return (
-                <div key={msg.id} className={`rounded-xl border p-2.5 text-xs ${badgeColor}`}>
-                  <div className="mb-1 flex items-center justify-between gap-2">
-                    <div className="font-semibold text-slate-100">
-                      <span>{msg.fromName}</span>
-                      <span className="mx-1 text-slate-500">→</span>
-                      <span className="text-sky-300">{msg.toName}</span>
+            {filteredComms.length === 0 ? (
+              <div className="rounded-xl border border-dashed border-slate-800 p-6 text-center text-xs text-slate-400">
+                {comms.length === 0
+                  ? 'Belum ada percakapan di ruangan.'
+                  : 'Tidak ada pesan pada filter ini.'}
+              </div>
+            ) : (
+              filteredComms.map((msg) => {
+                const meta = COMMS_CATEGORY_META[msg.kind] || COMMS_CATEGORY_META.system;
+                const fromLabel = stripUniqueSymbols(msg.fromName) || msg.fromName;
+                const toLabel = stripUniqueSymbols(msg.toName) || msg.toName;
+
+                return (
+                  <div key={msg.id} className={`rounded-xl border p-3 ${meta.cardCls}`}>
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-xs font-semibold text-slate-100">
+                        <span className="truncate">{fromLabel}</span>
+                        <ArrowRight
+                          className="h-3 w-3 shrink-0 text-slate-500"
+                          aria-hidden="true"
+                        />
+                        <span className="truncate text-sky-300">{toLabel}</span>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-1.5">
+                        <span
+                          className={`rounded-md border px-1.5 py-0.5 text-[10px] font-semibold ${meta.pillCls}`}
+                        >
+                          {meta.label}
+                        </span>
+                        <span className="font-mono text-[10px] tabular-nums text-slate-500">
+                          {formatTimeHMS(msg.timestamp)}
+                        </span>
+                      </div>
                     </div>
-                    <span className="font-mono text-[10px] text-slate-500">
-                      {new Date(msg.timestamp).toLocaleTimeString('id-ID', {
-                        hour: '2-digit',
-                        minute: '2-digit',
-                        second: '2-digit',
-                      })}
-                    </span>
+                    <div className="mt-2 border-t border-slate-800/50 pt-2">
+                      <MarkdownView content={msg.content} compact />
+                    </div>
                   </div>
-                  <p className="whitespace-pre-wrap leading-relaxed text-slate-300">{msg.content}</p>
-                </div>
-              );
-            })}
+                );
+              })
+            )}
             <div ref={commsEndRef} />
           </div>
         )}
 
         {tab === 'tasks' && (
-          <div className="flex flex-col gap-2.5">
+          <div className="flex flex-col gap-3">
             {missions.length > 0 && (
               <div className="space-y-1.5">
                 <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">
@@ -419,26 +590,20 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                   .map((m) => (
                     <div
                       key={m.id}
-                      className="flex items-center justify-between gap-2 rounded-xl border border-slate-800/90 bg-slate-950/60 px-2.5 py-2 text-xs"
+                      className="flex items-center justify-between gap-2 rounded-xl border border-slate-800/90 bg-slate-950/60 px-3 py-2 text-xs"
                     >
                       <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-1.5">
+                        <div className="flex items-center gap-2">
                           <span
-                            className={`rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase ${
-                              m.status === 'running'
-                                ? 'bg-amber-500/20 text-amber-300'
-                                : m.status === 'completed'
-                                  ? 'bg-emerald-500/20 text-emerald-300'
-                                  : 'bg-rose-500/20 text-rose-300'
+                            className={`shrink-0 rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase ${
+                              MISSION_STATUS_META[m.status].cls
                             }`}
                           >
-                            {m.status === 'running'
-                              ? 'Berjalan'
-                              : m.status === 'completed'
-                                ? 'Selesai'
-                                : 'Gagal'}
+                            {MISSION_STATUS_META[m.status].label}
                           </span>
-                          <span className="truncate text-[11px] text-slate-200">{m.prompt}</span>
+                          <span className="truncate text-[11px] text-slate-200">
+                            {cleanOneLine(m.prompt, 'Misi')}
+                          </span>
                         </div>
                       </div>
                       {m.finalSummary && (
@@ -455,8 +620,20 @@ export const RightPanel: React.FC<RightPanelProps> = ({
               </div>
             )}
 
-            <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">
-              Sub-Tugas & Dependensi ({tasks.length})
+            <div className="flex flex-col gap-2">
+              <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+                Sub-Tugas & Dependensi ({tasks.length})
+              </div>
+              <FilterPillBar
+                ariaLabel="Filter status tugas"
+                value={taskFilter}
+                onChange={setTaskFilter}
+                options={[
+                  { id: 'all', label: 'Semua', count: tasks.length },
+                  { id: 'active', label: 'Aktif & Macet', count: activeTaskCount },
+                  { id: 'done', label: 'Selesai & Gagal', count: doneTaskCount },
+                ]}
+              />
             </div>
 
             {tasks.length === 0 ? (
@@ -464,8 +641,12 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                 Belum ada sub-tugas. Kirim perintah di Command Bar bawah untuk melihat bot saling
                 membagi tugas secara otomatis.
               </div>
+            ) : filteredTasks.length === 0 ? (
+              <div className="rounded-xl border border-dashed border-slate-800 p-6 text-center text-xs text-slate-400">
+                Tidak ada tugas pada kategori ini.
+              </div>
             ) : (
-              [...tasks].reverse().map((task) => {
+              filteredTasks.map((task) => {
                 const assignee = agents.find((a) => a.id === task.assignedToId);
                 const assigner = agents.find((a) => a.id === task.assignedById);
                 const st = STATUS_BADGES[task.status] || STATUS_BADGES.queued;
@@ -474,7 +655,7 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                   .map((depId) => tasks.find((t) => t.id === depId))
                   .filter((t): t is Task => Boolean(t));
                 const pendingDeps = depTasks.filter(
-                  (t) => t.status !== 'completed' && t.status !== 'failed'
+                  (t) => !isTerminalTaskStatus(t.status)
                 ).length;
                 const isCancellable = CANCELLABLE_STATUSES.has(task.status);
                 const isStuck = task.status === 'stuck';
@@ -486,6 +667,15 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                   capableReassignAgents.find((a) => a.id !== task.assignedToId)?.id ||
                   capableReassignAgents[0]?.id ||
                   '';
+
+                const assignerLabel = stripUniqueSymbols(
+                  assigner?.name || (task.assignedById === 'user' ? 'Owner' : task.assignedById)
+                );
+                const assigneeLabel = stripUniqueSymbols(assignee?.name || task.assignedToId);
+                const cleanedTitle = cleanOneLine(task.title, 'Tugas');
+                const previewSnippet = cleanOneLine(
+                  task.error || task.result || task.instructions || ''
+                );
 
                 return (
                   <div
@@ -499,27 +689,20 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                     <button
                       type="button"
                       onClick={() => setExpandedTaskId(open ? null : task.id)}
-                      className="flex w-full items-start justify-between gap-2 p-2.5 text-left cursor-pointer"
+                      className="flex w-full flex-col p-3 text-left cursor-pointer"
                     >
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-1.5">
-                          {open ? (
-                            <ChevronDown className="h-3.5 w-3.5 shrink-0 text-slate-400" />
-                          ) : (
-                            <ChevronRight className="h-3.5 w-3.5 shrink-0 text-slate-400" />
-                          )}
-                          <span className="truncate text-xs font-semibold text-slate-100">
-                            {task.title}
-                          </span>
-                        </div>
-                        <div className="mt-1 flex flex-wrap items-center gap-1.5 pl-5 text-[11px] text-slate-400">
-                          <span>{assigner?.name || task.assignedById}</span>
-                          <span>→</span>
+                      <div className="flex w-full items-start justify-between gap-2">
+                        <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[11px] text-slate-400">
+                          <span>{assignerLabel}</span>
+                          <ArrowRight
+                            className="h-3 w-3 shrink-0 text-slate-500"
+                            aria-hidden="true"
+                          />
                           <span
                             className="font-medium"
                             style={{ color: assignee?.color || '#38bdf8' }}
                           >
-                            {assignee?.name || task.assignedToId}
+                            {assigneeLabel}
                           </span>
                           {task.dependsOnTaskIds.length > 0 && (
                             <span
@@ -535,16 +718,37 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                             </span>
                           )}
                         </div>
+                        <span
+                          className={`shrink-0 rounded-md px-2 py-0.5 text-[10px] font-semibold ${st.cls}`}
+                        >
+                          {st.label}
+                        </span>
                       </div>
-                      <span
-                        className={`shrink-0 rounded-md px-2 py-0.5 text-[10px] font-semibold ${st.cls}`}
-                      >
-                        {st.label}
-                      </span>
+
+                      <div className="mt-1.5 flex items-start gap-1.5">
+                        {open ? (
+                          <ChevronDown className="mt-0.5 h-3.5 w-3.5 shrink-0 text-slate-400" />
+                        ) : (
+                          <ChevronRight className="mt-0.5 h-3.5 w-3.5 shrink-0 text-slate-400" />
+                        )}
+                        <span className="line-clamp-2 text-[13px] font-semibold leading-snug text-slate-100">
+                          {cleanedTitle}
+                        </span>
+                      </div>
+
+                      {!open && previewSnippet && (
+                        <p
+                          className={`mt-1.5 line-clamp-2 pl-5 text-[11px] leading-relaxed ${
+                            task.error ? 'text-rose-300/90' : 'text-slate-400'
+                          }`}
+                        >
+                          {previewSnippet}
+                        </p>
+                      )}
                     </button>
 
                     {(isStuck || isCancellable) && (
-                      <div className="flex flex-wrap items-center gap-1.5 border-t border-slate-800/70 px-2.5 py-2">
+                      <div className="flex flex-wrap items-center gap-2 border-t border-slate-800/70 px-3 py-2.5">
                         {isStuck && (
                           <>
                             <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-orange-300">
@@ -552,7 +756,7 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                               <span>Tanpa kabar &gt; 10 menit:</span>
                             </span>
                             {capableReassignAgents.length > 0 && (
-                              <div className="flex items-center gap-1">
+                              <div className="flex flex-wrap items-center gap-1.5">
                                 <select
                                   value={chosenReassignId}
                                   onChange={(e) =>
@@ -562,11 +766,11 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                                     }))
                                   }
                                   aria-label="Pilih bot untuk tugaskan ulang"
-                                  className="rounded border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[10px] text-slate-200 outline-none"
+                                  className="rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-[11px] text-slate-200 outline-none"
                                 >
                                   {capableReassignAgents.map((a) => (
                                     <option key={a.id} value={a.id}>
-                                      {a.name}
+                                      {stripUniqueSymbols(a.name) || a.name}
                                     </option>
                                   ))}
                                 </select>
@@ -581,9 +785,9 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                                       setBusyTaskId(null);
                                     }
                                   }}
-                                  className="inline-flex items-center gap-1 rounded border border-sky-500/45 bg-sky-500/15 px-2 py-0.5 text-[10px] font-semibold text-sky-200 transition hover:bg-sky-500/25 disabled:opacity-45 cursor-pointer"
+                                  className="inline-flex items-center gap-1 rounded-md border border-sky-500/45 bg-sky-500/15 px-2.5 py-1 text-[11px] font-semibold text-sky-200 transition hover:bg-sky-500/25 disabled:opacity-45 cursor-pointer"
                                 >
-                                  <RefreshCw className="h-2.5 w-2.5" />
+                                  <RefreshCw className="h-3 w-3" />
                                   <span>Tugaskan Ulang</span>
                                 </button>
                               </div>
@@ -599,9 +803,9 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                                   setBusyTaskId(null);
                                 }
                               }}
-                              className="inline-flex items-center gap-1 rounded border border-rose-500/45 bg-rose-500/15 px-2 py-0.5 text-[10px] font-semibold text-rose-200 transition hover:bg-rose-500/25 disabled:opacity-45 cursor-pointer"
+                              className="inline-flex items-center gap-1 rounded-md border border-rose-500/45 bg-rose-500/15 px-2.5 py-1 text-[11px] font-semibold text-rose-200 transition hover:bg-rose-500/25 disabled:opacity-45 cursor-pointer"
                             >
-                              <XCircle className="h-2.5 w-2.5" />
+                              <XCircle className="h-3 w-3" />
                               <span>Tandai Gagal</span>
                             </button>
                           </>
@@ -618,9 +822,9 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                                 setBusyTaskId(null);
                               }
                             }}
-                            className="ml-auto inline-flex items-center gap-1 rounded border border-rose-500/40 bg-rose-950/50 px-2 py-0.5 text-[10px] font-semibold text-rose-200 transition hover:bg-rose-500/25 disabled:opacity-45 cursor-pointer"
+                            className="ml-auto inline-flex items-center gap-1 rounded-md border border-rose-500/40 bg-rose-950/50 px-2.5 py-1 text-[11px] font-semibold text-rose-200 transition hover:bg-rose-500/25 disabled:opacity-45 cursor-pointer"
                           >
-                            <Ban className="h-2.5 w-2.5" />
+                            <Ban className="h-3 w-3" />
                             <span>Batalkan tugas</span>
                           </button>
                         )}
@@ -628,13 +832,13 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                     )}
 
                     {open && (
-                      <div className="border-t border-slate-800/80 px-3 py-2.5 text-xs">
+                      <div className="border-t border-slate-800/80 px-3 py-3 text-xs">
                         {task.dependsOnTaskIds.length > 0 && (
-                          <div className="mb-2.5 rounded-lg border border-slate-800 bg-slate-900/70 p-2">
-                            <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+                          <div className="mb-3 rounded-lg border border-slate-800 bg-slate-900/70 p-2.5">
+                            <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
                               Dependensi ({task.dependsOnTaskIds.length})
                             </div>
-                            <div className="flex flex-wrap gap-1">
+                            <div className="flex flex-wrap gap-1.5">
                               {task.dependsOnTaskIds.map((depId) => {
                                 const dep = tasks.find((t) => t.id === depId);
                                 const depBadge = dep
@@ -645,7 +849,7 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                                     key={depId}
                                     className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] ${depBadge.cls}`}
                                   >
-                                    <span>{dep?.title || depId}</span>
+                                    <span>{cleanOneLine(dep?.title, depId)}</span>
                                     <span className="opacity-75">({depBadge.label})</span>
                                   </span>
                                 );
@@ -653,38 +857,42 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                             </div>
                           </div>
                         )}
-                        <div className="mb-2 text-[11px] font-medium text-slate-400">Instruksi:</div>
-                        <p className="mb-3 whitespace-pre-wrap rounded-lg bg-slate-900 p-2 text-slate-300">
-                          {task.instructions}
-                        </p>
+                        <div className="mb-1.5 text-[11px] font-medium text-slate-400">
+                          Instruksi:
+                        </div>
+                        <div className="mb-3 rounded-lg border border-slate-800/75 bg-slate-900/80 p-2.5">
+                          <MarkdownView content={task.instructions} compact />
+                        </div>
                         {task.result && (
                           <>
-                            <div className="mb-1 flex items-center gap-1 text-[11px] font-medium text-emerald-400">
+                            <div className="mb-1.5 flex items-center gap-1 text-[11px] font-medium text-emerald-400">
                               <CheckCircle2 className="h-3.5 w-3.5" />
                               <span>Hasil Pekerjaan:</span>
                             </div>
                             <div className="rounded-lg border border-emerald-500/20 bg-emerald-950/20 p-2.5 text-slate-200">
-                              <MarkdownView content={task.result} />
+                              <MarkdownView content={task.result} compact />
                             </div>
                           </>
                         )}
                         {task.error && (
-                          <div className="flex items-center gap-1.5 rounded-lg border border-rose-500/30 bg-rose-950/30 p-2 text-rose-300">
-                            <XCircle className="h-3.5 w-3.5 shrink-0" />
-                            <span>{task.error}</span>
+                          <div className="mt-2 flex items-start gap-2 rounded-lg border border-rose-500/30 bg-rose-950/30 p-2.5 text-rose-300">
+                            <XCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                            <span className="text-[11px] leading-relaxed">
+                              {cleanDisplayText(task.error, { stripMarkdown: true })}
+                            </span>
                           </div>
                         )}
                         {!task.result && !task.error && (
                           <div className="flex items-center gap-1.5 text-[11px] text-slate-400">
-                            <Clock className="h-3.5 w-3.5" />
+                            <Clock className="h-3.5 w-3.5 shrink-0" />
                             <span>
                               {task.status === 'waiting-dependency'
                                 ? 'Menunggu tugas pendahulu selesai sebelum dieksekusi...'
                                 : task.status === 'queued'
                                   ? 'Dalam antrean eksekusi...'
                                   : task.status === 'assigned' || task.status === 'delegated'
-                                    ? `Tugas dikirim ke ${assignee?.name || task.assignedToId}, menunggu pengerjaan...`
-                                    : `Sedang diproses di workstation ${assignee?.name || task.assignedToId}...`}
+                                    ? `Tugas dikirim ke ${assigneeLabel}, menunggu pengerjaan...`
+                                    : `Sedang diproses di workstation ${assigneeLabel}...`}
                             </span>
                           </div>
                         )}
@@ -704,7 +912,7 @@ export const RightPanel: React.FC<RightPanelProps> = ({
             </div>
 
             {missions.length > 0 && (
-              <div className="flex flex-col gap-2">
+              <div className="flex flex-col gap-2.5">
                 {[...missions]
                   .reverse()
                   .filter((m) => tasks.some((t) => t.missionId === m.id))
@@ -728,26 +936,54 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                       const fromBot = agents.find((a) => a.id === node.assignedById);
                       const badge = STATUS_BADGES[node.status] || STATUS_BADGES.queued;
                       const children = childrenMap.get(node.id) || [];
+                      const roleLabel = depth === 0 ? 'Tugas' : 'Sub-delegasi';
+                      const fromLabel = fromBot
+                        ? stripUniqueSymbols(fromBot.name) || fromBot.name
+                        : node.assignedById === 'user'
+                          ? 'Owner'
+                          : node.assignedById;
+                      const toLabel = stripUniqueSymbols(worker?.name || node.assignedToId);
+
                       return (
-                        <div key={node.id} className={depth > 0 ? 'ml-3 border-l border-slate-700/80 pl-2.5 mt-1.5' : 'mt-1.5'}>
-                          <div className="flex items-start justify-between gap-2 rounded-lg border border-slate-800/80 bg-slate-900/70 px-2 py-1.5 text-[11px]">
-                            <div className="min-w-0">
-                              <div className="flex items-center gap-1.5 font-medium text-slate-200">
-                                <span className="text-[10px] uppercase tracking-wide text-slate-400">
-                                  {depth === 0 ? 'Tugas' : 'Sub-delegasi'}
-                                </span>
-                                <span className="truncate">{node.title}</span>
-                              </div>
-                              <div className="mt-0.5 text-[10px] text-slate-400">
-                                {fromBot ? fromBot.name : node.assignedById === 'user' ? 'Owner' : node.assignedById} →{' '}
-                                <span style={{ color: worker?.color || '#38bdf8' }}>
-                                  {worker?.name || node.assignedToId}
-                                </span>
-                              </div>
+                        <div
+                          key={node.id}
+                          className={
+                            depth > 0 ? 'mt-2 ml-3 border-l-2 border-slate-700/80 pl-2.5' : 'mt-2'
+                          }
+                        >
+                          <div className="rounded-lg border border-slate-800/90 bg-slate-900/75 px-2.5 py-2">
+                            <div className="flex items-center justify-between gap-2">
+                              <span
+                                className={`rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider ${
+                                  depth === 0
+                                    ? 'bg-slate-800 text-slate-300'
+                                    : 'bg-violet-500/15 text-violet-300'
+                                }`}
+                              >
+                                {roleLabel}
+                              </span>
+                              <span
+                                className={`shrink-0 rounded px-1.5 py-0.5 text-[9px] font-semibold ${badge.cls}`}
+                              >
+                                {badge.label}
+                              </span>
                             </div>
-                            <span className={`shrink-0 rounded px-1.5 py-0.5 text-[9px] font-semibold ${badge.cls}`}>
-                              {badge.label}
-                            </span>
+                            <div className="mt-1.5 line-clamp-2 text-xs font-semibold leading-snug text-slate-100">
+                              {cleanOneLine(node.title, 'Tugas')}
+                            </div>
+                            <div className="mt-1.5 flex flex-wrap items-center gap-1 text-[10px] text-slate-400">
+                              <span>{fromLabel}</span>
+                              <ArrowRight
+                                className="h-2.5 w-2.5 shrink-0 text-slate-500"
+                                aria-hidden="true"
+                              />
+                              <span
+                                className="font-medium"
+                                style={{ color: worker?.color || '#38bdf8' }}
+                              >
+                                {toLabel}
+                              </span>
+                            </div>
                           </div>
                           {children.map((child) => renderNode(child, depth + 1))}
                         </div>
@@ -757,28 +993,54 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                     return (
                       <div
                         key={`chain-${m.id}`}
-                        className="rounded-xl border border-slate-800 bg-slate-950/75 p-2.5"
+                        className="rounded-xl border border-slate-800 bg-slate-950/75 p-3"
                       >
                         <div className="flex items-center justify-between gap-2">
                           <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-sky-300">
                             <GitBranch className="h-3 w-3 shrink-0" />
-                            <span>Misi → Tugas → Sub-delegasi</span>
+                            <span className="inline-flex items-center gap-1">
+                              <span>Misi</span>
+                              <ArrowRight
+                                className="h-2.5 w-2.5 shrink-0 text-sky-400/80"
+                                aria-hidden="true"
+                              />
+                              <span>Tugas</span>
+                              <ArrowRight
+                                className="h-2.5 w-2.5 shrink-0 text-sky-400/80"
+                                aria-hidden="true"
+                              />
+                              <span>Sub-delegasi</span>
+                            </span>
                           </div>
                           <span
-                            className={`rounded px-1.5 py-0.5 text-[9px] font-semibold ${
-                              m.status === 'completed'
-                                ? 'bg-emerald-500/20 text-emerald-300'
-                                : m.status === 'failed'
-                                  ? 'bg-rose-500/20 text-rose-300'
-                                  : 'bg-amber-500/20 text-amber-300'
+                            className={`shrink-0 rounded px-1.5 py-0.5 text-[9px] font-semibold ${
+                              MISSION_STATUS_META[m.status].cls
                             }`}
                           >
-                            {m.status === 'completed' ? 'Selesai' : m.status === 'failed' ? 'Gagal' : 'Berjalan'}
+                            {MISSION_STATUS_META[m.status].label}
                           </span>
                         </div>
-                        <div className="mt-1 line-clamp-2 text-[11px] font-semibold text-slate-100">
-                          {m.prompt}
+
+                        <div className="mt-2 rounded-lg border border-slate-800/80 bg-slate-900/60 px-2.5 py-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="rounded bg-sky-500/15 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-sky-300">
+                              Misi
+                            </span>
+                            {m.finalSummary && (
+                              <button
+                                type="button"
+                                onClick={() => onOpenReport(m)}
+                                className="rounded border border-emerald-500/35 bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-200 transition hover:bg-emerald-500/25 cursor-pointer"
+                              >
+                                Buka Laporan
+                              </button>
+                            )}
+                          </div>
+                          <div className="mt-1.5 line-clamp-2 text-xs font-semibold leading-snug text-slate-100">
+                            {cleanOneLine(m.prompt, 'Misi')}
+                          </div>
                         </div>
+
                         <div className="mt-1">{roots.map((r) => renderNode(r, 0))}</div>
                       </div>
                     );
@@ -799,79 +1061,92 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                     className="rounded-xl border border-emerald-500/30 bg-slate-950/80 p-3"
                   >
                     <div className="mb-2 flex items-start justify-between gap-2">
-                      <div className="min-w-0">
+                      <div className="min-w-0 flex-1">
                         <div className="text-[10px] font-semibold uppercase tracking-wider text-emerald-400">
                           Laporan Akhir Misi
                         </div>
-                        <div className="line-clamp-2 text-xs font-semibold text-slate-100">
-                          {m.prompt}
+                        <div className="mt-0.5 line-clamp-2 text-xs font-semibold leading-snug text-slate-100">
+                          {cleanOneLine(m.prompt, 'Laporan Misi')}
                         </div>
                       </div>
-                      <div className="flex shrink-0 items-center gap-1">
+                      <div className="flex shrink-0 items-center gap-1.5">
                         <button
                           type="button"
                           onClick={() => handleCopyMarkdown(m.id, m.finalSummary || '')}
-                          className="rounded border border-slate-700 bg-slate-800 p-1 text-slate-300 hover:bg-slate-700 cursor-pointer"
+                          className="inline-flex items-center gap-1 rounded-md border border-slate-700 bg-slate-800 px-2 py-1 text-[10px] font-medium text-slate-200 transition hover:bg-slate-700 cursor-pointer"
                           title="Salin Markdown"
                         >
                           {copiedDeliverableId === m.id ? (
-                            <Check className="h-3 w-3 text-emerald-400" />
+                            <>
+                              <Check className="h-3 w-3 text-emerald-400" />
+                              <span>Disalin</span>
+                            </>
                           ) : (
-                            <Copy className="h-3 w-3" />
+                            <>
+                              <Copy className="h-3 w-3" />
+                              <span>Salin Markdown</span>
+                            </>
                           )}
                         </button>
                         <button
                           type="button"
                           onClick={() => onOpenReport(m)}
-                          className="rounded border border-emerald-500/40 bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-200 hover:bg-emerald-500/25 cursor-pointer"
+                          className="rounded-md border border-emerald-500/40 bg-emerald-500/15 px-2 py-1 text-[10px] font-semibold text-emerald-200 transition hover:bg-emerald-500/25 cursor-pointer"
                         >
-                          Perbesar
+                          Buka Laporan
                         </button>
                       </div>
                     </div>
-                    <div className="max-h-60 overflow-y-auto rounded-lg border border-slate-800/80 bg-slate-900/60 p-2.5">
-                      <MarkdownView content={m.finalSummary || ''} />
+                    <div className="max-h-72 overflow-y-auto rounded-lg border border-slate-800/80 bg-slate-900/60 p-3">
+                      <MarkdownView content={m.finalSummary || ''} compact />
                     </div>
                   </div>
                 ))}
 
                 {taskDeliverables.map((task) => {
                   const assignee = agents.find((a) => a.id === task.assignedToId);
+                  const assigneeLabel = stripUniqueSymbols(assignee?.name || task.assignedToId);
                   return (
                     <div
                       key={task.id}
                       className="rounded-xl border border-slate-800 bg-slate-950/75 p-3"
                     >
                       <div className="mb-2 flex items-start justify-between gap-2">
-                        <div className="min-w-0">
+                        <div className="min-w-0 flex-1">
                           <div className="flex items-center gap-1.5">
                             <span
-                              className="h-2 w-2 rounded-full"
+                              className="h-2 w-2 shrink-0 rounded-full"
                               style={{ backgroundColor: assignee?.color || '#38bdf8' }}
                             />
                             <span className="text-[10px] font-semibold text-slate-400">
-                              {assignee?.name || task.assignedToId}
+                              {assigneeLabel}
                             </span>
                           </div>
-                          <div className="truncate text-xs font-semibold text-slate-100">
-                            {task.title}
+                          <div className="mt-0.5 line-clamp-2 text-xs font-semibold leading-snug text-slate-100">
+                            {cleanOneLine(task.title, 'Hasil Tugas')}
                           </div>
                         </div>
                         <button
                           type="button"
                           onClick={() => handleCopyMarkdown(task.id, task.result || '')}
-                          className="shrink-0 rounded border border-slate-700 bg-slate-800 p-1 text-slate-300 hover:bg-slate-700 cursor-pointer"
+                          className="inline-flex shrink-0 items-center gap-1 rounded-md border border-slate-700 bg-slate-800 px-2 py-1 text-[10px] font-medium text-slate-200 transition hover:bg-slate-700 cursor-pointer"
                           title="Salin Markdown"
                         >
                           {copiedDeliverableId === task.id ? (
-                            <Check className="h-3 w-3 text-emerald-400" />
+                            <>
+                              <Check className="h-3 w-3 text-emerald-400" />
+                              <span>Disalin</span>
+                            </>
                           ) : (
-                            <Copy className="h-3 w-3" />
+                            <>
+                              <Copy className="h-3 w-3" />
+                              <span>Salin Markdown</span>
+                            </>
                           )}
                         </button>
                       </div>
-                      <div className="max-h-56 overflow-y-auto rounded-lg border border-slate-800/80 bg-slate-900/50 p-2.5">
-                        <MarkdownView content={task.result || ''} />
+                      <div className="max-h-64 overflow-y-auto rounded-lg border border-slate-800/80 bg-slate-900/50 p-3">
+                        <MarkdownView content={task.result || ''} compact />
                       </div>
                     </div>
                   );
@@ -893,7 +1168,7 @@ export const RightPanel: React.FC<RightPanelProps> = ({
         )}
       </div>
 
-      {/* Bottom Mini Bot-to-Bot Command Sender (visible on Comms tab) */}
+      {/* Bottom Mini Bot-to-Bot Command Sender (visible on Percakapan tab) */}
       {tab === 'comms' && agents.length >= 2 && (
         <form
           onSubmit={handleRelaySubmit}
@@ -915,23 +1190,25 @@ export const RightPanel: React.FC<RightPanelProps> = ({
             <select
               value={relayFrom}
               onChange={(e) => setRelayFrom(e.target.value)}
+              aria-label="Bot pengirim"
               className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-[11px] text-slate-200 outline-none"
             >
               {agents.map((a) => (
                 <option key={a.id} value={a.id}>
-                  Dari: {a.name}
+                  Dari: {stripUniqueSymbols(a.name) || a.name}
                 </option>
               ))}
             </select>
-            <span className="text-slate-500">→</span>
+            <ArrowRight className="h-3.5 w-3.5 shrink-0 text-slate-500" aria-hidden="true" />
             <select
               value={relayTo}
               onChange={(e) => setRelayTo(e.target.value)}
+              aria-label="Bot penerima"
               className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-[11px] text-slate-200 outline-none"
             >
               {agents.map((a) => (
                 <option key={a.id} value={a.id}>
-                  Ke: {a.name}
+                  Ke: {stripUniqueSymbols(a.name) || a.name}
                 </option>
               ))}
             </select>
@@ -1041,7 +1318,7 @@ const BotInspector: React.FC<BotInspectorProps> = ({
               className="h-2 w-2 rounded-full"
               style={{ backgroundColor: a.status === 'offline' ? '#ef4444' : a.color }}
             />
-            <span>{a.name}</span>
+            <span>{stripUniqueSymbols(a.name) || a.name}</span>
           </button>
         ))}
       </div>
@@ -1060,9 +1337,11 @@ const BotInspector: React.FC<BotInspectorProps> = ({
                   <Bot className="h-4 w-4" />
                 </div>
                 <div>
-                  <div className="text-xs font-bold text-slate-100">{selectedAgent.name}</div>
+                  <div className="text-xs font-bold text-slate-100">
+                    {stripUniqueSymbols(selectedAgent.name) || selectedAgent.name}
+                  </div>
                   <div className="font-mono text-[10px] text-slate-400">
-                    ID: {selectedAgent.id} • {selectedAgent.type}
+                    ID: {selectedAgent.id} / {selectedAgent.type}
                   </div>
                 </div>
               </div>

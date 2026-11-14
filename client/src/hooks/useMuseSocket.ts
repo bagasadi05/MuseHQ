@@ -5,6 +5,7 @@ import {
   CommsMessage,
   Mission,
   PublicSettings,
+  SpeechBubble,
   Task,
   WorkspaceSnapshot,
   ZoneId,
@@ -175,8 +176,27 @@ export function useMuseSocket() {
   const sseInFlightRef = useRef<boolean>(false);
   const pollInFlightRef = useRef<boolean>(false);
   const cloudBootedRef = useRef<boolean>(false);
+  const lastCommandAtRef = useRef<number>(0);
+  const hasActiveWorkRef = useRef<boolean>(false);
+  const kickCloudPollRef = useRef<() => void>(() => {});
   const agentsRef = useRef<Agent[]>([]);
   agentsRef.current = agents;
+  hasActiveWorkRef.current =
+    missions.some((m) => m.status === 'running') ||
+    tasks.some(
+      (t) =>
+        t.status === 'working' ||
+        t.status === 'in-progress' ||
+        t.status === 'assigned' ||
+        t.status === 'delegated'
+    );
+
+  const markCommandActivity = useCallback(() => {
+    lastCommandAtRef.current = Date.now();
+    if (transportRef.current === 'cloud') {
+      kickCloudPollRef.current();
+    }
+  }, []);
 
   const applySnapshot = useCallback((rawSnap: WorkspaceSnapshot) => {
     const snap = normalizeSnapshotZones(rawSnap);
@@ -245,7 +265,18 @@ export function useMuseSocket() {
         case 'beam:created': {
           const incoming = payload as CommandBeam;
           const now = Date.now();
-          setBeams((prev) => [...prev.filter((b) => b.expiresAt > now), incoming]);
+          setBeams((prev) => [
+            ...prev.filter(
+              (b) =>
+                b.expiresAt > now &&
+                !(
+                  b.id.startsWith('opt-beam-') &&
+                  b.fromAgentId === incoming.fromAgentId &&
+                  b.toAgentId === incoming.toAgentId
+                )
+            ),
+            incoming,
+          ]);
           break;
         }
         case 'settings:updated':
@@ -314,6 +345,9 @@ export function useMuseSocket() {
     let active = true;
     let socket: WebSocket | null = null;
     let cloudPollTimer: number | null = null;
+    let wsRetryDelayMs = 400;
+    let catchupInFlight = false;
+    let lastFocusSyncAt = 0;
 
     const connectWebSocket = () => {
       if (!active) return;
@@ -322,6 +356,7 @@ export function useMuseSocket() {
       socket = new WebSocket(wsUrl);
 
       socket.onopen = () => {
+        wsRetryDelayMs = 400;
         if (active) setConnected(true);
       };
 
@@ -332,7 +367,9 @@ export function useMuseSocket() {
           setAuthStatus('locked');
           return;
         }
-        reconnectTimer.current = window.setTimeout(connectWebSocket, 1800);
+        const delay = wsRetryDelayMs;
+        wsRetryDelayMs = Math.min(2500, wsRetryDelayMs * 2);
+        reconnectTimer.current = window.setTimeout(connectWebSocket, delay);
       };
 
       socket.onmessage = (evt) => {
@@ -487,10 +524,31 @@ export function useMuseSocket() {
           cloudBootedRef.current = true;
         }
 
+        const scheduleNextCloudPoll = () => {
+          if (!active) return;
+          if (cloudPollTimer !== null) {
+            clearTimeout(cloudPollTimer);
+            cloudPollTimer = null;
+          }
+          const isHot =
+            hasActiveWorkRef.current || Date.now() - lastCommandAtRef.current < 10_000;
+          const intervalMs = isHot ? 900 : 2500;
+          cloudPollTimer = window.setTimeout(() => {
+            cloudPollTimer = null;
+            void pollCloudState().finally(() => {
+              scheduleNextCloudPoll();
+            });
+          }, intervalMs);
+        };
+
+        kickCloudPollRef.current = () => {
+          if (active && cloudBootedRef.current && transportRef.current === 'cloud') {
+            scheduleNextCloudPoll();
+          }
+        };
+
         if (active) {
-          cloudPollTimer = window.setInterval(() => {
-            void pollCloudState();
-          }, 2500);
+          scheduleNextCloudPoll();
         }
         return;
       }
@@ -509,12 +567,60 @@ export function useMuseSocket() {
         });
     };
 
+    const handleVisibilityOrFocus = () => {
+      if (!active) return;
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      const now = Date.now();
+      if (now - lastFocusSyncAt < 250) return;
+      lastFocusSyncAt = now;
+
+      if (transportRef.current === 'cloud') {
+        if (cloudBootedRef.current) {
+          void pollCloudState();
+        }
+        return;
+      }
+
+      if (
+        !socket ||
+        (socket.readyState !== WebSocket.OPEN && socket.readyState !== WebSocket.CONNECTING)
+      ) {
+        if (reconnectTimer.current) {
+          clearTimeout(reconnectTimer.current);
+          reconnectTimer.current = null;
+        }
+        wsRetryDelayMs = 400;
+        connectWebSocket();
+      }
+
+      if (catchupInFlight) return;
+      catchupInFlight = true;
+      apiJson<WorkspaceSnapshot>('/api/state')
+        .then((snap) => {
+          if (active) applySnapshot(snap);
+        })
+        .catch((err) => {
+          if (active && err instanceof ApiHttpError && err.status === 401) {
+            setAuthStatus('locked');
+          }
+        })
+        .finally(() => {
+          catchupInFlight = false;
+        });
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityOrFocus);
+    window.addEventListener('focus', handleVisibilityOrFocus);
+
     void boot();
 
     return () => {
       active = false;
+      kickCloudPollRef.current = () => {};
+      document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
+      window.removeEventListener('focus', handleVisibilityOrFocus);
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
-      if (cloudPollTimer) clearInterval(cloudPollTimer);
+      if (cloudPollTimer !== null) clearTimeout(cloudPollTimer);
       socket?.close();
     };
   }, [authStatus, applyEvent, applySnapshot]);
@@ -586,11 +692,73 @@ export function useMuseSocket() {
 
   const launchMission = useCallback(
     async (prompt: string, targetAgentId: string) => {
+      markCommandActivity();
+      const now = Date.now();
+      const targetAgent = agentsRef.current.find((a) => a.id === targetAgentId);
+      const optBeamId = `opt-beam-${now}-${Math.random().toString(36).slice(2, 6)}`;
+      const optBubble: SpeechBubble = {
+        text: 'Menerima perintah...',
+        kind: 'command',
+        expiresAt: now + 3200,
+      };
+      const prevBubble = targetAgent?.speechBubble ?? null;
+
+      if (targetAgentId) {
+        const optBeam: CommandBeam = {
+          id: optBeamId,
+          fromAgentId: 'user',
+          toAgentId: targetAgentId,
+          label: 'Perintah baru',
+          color: targetAgent?.color || '#f59e0b',
+          createdAt: now,
+          expiresAt: now + 3200,
+        };
+        setBeams((prev) => [...prev.filter((b) => b.expiresAt > now), optBeam]);
+        setAgents((prev) =>
+          prev.map((a) => (a.id === targetAgentId ? { ...a, speechBubble: optBubble } : a))
+        );
+      }
+
+      const revertOptimisticLaunch = () => {
+        const ts = Date.now();
+        setBeams((prev) => prev.filter((b) => b.id !== optBeamId));
+        if (targetAgentId) {
+          setAgents((prev) =>
+            prev.map((a) =>
+              a.id === targetAgentId && a.speechBubble === optBubble
+                ? {
+                    ...a,
+                    speechBubble: prevBubble && prevBubble.expiresAt > ts ? prevBubble : null,
+                  }
+                : a
+            )
+          );
+        }
+      };
+
       if (transportRef.current !== 'cloud') {
-        return apiJson<{ mission: Mission }>('/api/missions', {
-          method: 'POST',
-          body: JSON.stringify({ prompt, targetAgentId }),
-        }).catch(handleAuthGuard);
+        try {
+          const res = await apiJson<{ mission: Mission; snapshot?: WorkspaceSnapshot }>(
+            '/api/missions',
+            {
+              method: 'POST',
+              body: JSON.stringify({ prompt, targetAgentId }),
+            }
+          );
+          if (res.snapshot) {
+            applySnapshot(res.snapshot);
+          } else if (res.mission) {
+            setMissions((prev) =>
+              prev.some((m) => m.id === res.mission.id)
+                ? prev.map((m) => (m.id === res.mission.id ? res.mission : m))
+                : [...prev, res.mission]
+            );
+          }
+          return res;
+        } catch (err) {
+          revertOptimisticLaunch();
+          return handleAuthGuard(err);
+        }
       }
 
       const settingsPatch = loadSafeCloudPreferences() || undefined;
@@ -673,11 +841,14 @@ export function useMuseSocket() {
           throw new Error(sseErrorMessage);
         }
         return { ok: true };
+      } catch (err) {
+        revertOptimisticLaunch();
+        throw err;
       } finally {
         sseInFlightRef.current = false;
       }
     },
-    [applyEvent, applySnapshot]
+    [applyEvent, applySnapshot, markCommandActivity]
   );
 
   const createAgent = useCallback(
@@ -740,42 +911,118 @@ export function useMuseSocket() {
       createTask = false,
       title?: string
     ) => {
+      markCommandActivity();
       const isCloud = transportRef.current === 'cloud';
       const settingsPatch = isCloud ? loadSafeCloudPreferences() || undefined : undefined;
-      const res = await apiJson<{ ok: boolean; snapshot?: WorkspaceSnapshot }>(
-        `/api/agents/${encodeURIComponent(fromAgentId)}/chat`,
-        {
-          method: 'POST',
-          body: JSON.stringify({
+
+      const now = Date.now();
+      const fromAgent = agentsRef.current.find((a) => a.id === fromAgentId);
+      const toAgent =
+        toAgentId !== 'all' ? agentsRef.current.find((a) => a.id === toAgentId) : undefined;
+      const optBeamId = `opt-beam-${now}-${Math.random().toString(36).slice(2, 6)}`;
+      const optSenderBubble: SpeechBubble = {
+        text: createTask
+          ? `Delegasi: ${title?.trim() || content.trim().slice(0, 48)}`
+          : content.trim().slice(0, 72),
+        kind: createTask ? 'command' : 'chat',
+        expiresAt: now + 3000,
+      };
+      const optReceiverBubble: SpeechBubble | null =
+        createTask && toAgent
+          ? { text: 'Menerima perintah...', kind: 'command', expiresAt: now + 3000 }
+          : null;
+      const prevSenderBubble = fromAgent?.speechBubble ?? null;
+      const prevReceiverBubble = toAgent?.speechBubble ?? null;
+
+      if (toAgent) {
+        setBeams((prev) => [
+          ...prev.filter((b) => b.expiresAt > now),
+          {
+            id: optBeamId,
+            fromAgentId,
             toAgentId,
-            content,
-            createTask,
-            title,
-            ...(isCloud && (settingsPatch || agentsRef.current.length > 0)
-              ? { clientContext: { agents: agentsRef.current, settingsPatch } }
-              : {}),
-          }),
-        }
-      ).catch(handleAuthGuard);
-      if (isCloud && res.snapshot) {
-        if (typeof res.snapshot.cursor === 'number') {
-          cursorRef.current = res.snapshot.cursor;
-        }
-        if (res.snapshot.missions) {
-          setMissions(res.snapshot.missions);
-        }
-        if (res.snapshot.tasks) {
-          for (const t of res.snapshot.tasks) applyEvent('task:updated', t);
-        }
-        if (res.snapshot.comms) {
-          for (const c of res.snapshot.comms) applyEvent('comms:message', c);
-        }
-        if (res.snapshot.beams) setBeams(res.snapshot.beams);
-        if (res.snapshot.agents) setAgents(res.snapshot.agents.map(normalizeAgentZones));
+            label: createTask ? title?.trim() || 'Perintah baru' : content.trim().slice(0, 32),
+            color: fromAgent?.color || '#38bdf8',
+            createdAt: now,
+            expiresAt: now + 3000,
+          },
+        ]);
       }
-      return res;
+      setAgents((prev) =>
+        prev.map((a) => {
+          if (a.id === fromAgentId) return { ...a, speechBubble: optSenderBubble };
+          if (optReceiverBubble && toAgent && a.id === toAgent.id) {
+            return { ...a, speechBubble: optReceiverBubble };
+          }
+          return a;
+        })
+      );
+
+      try {
+        const res = await apiJson<{ ok: boolean; snapshot?: WorkspaceSnapshot }>(
+          `/api/agents/${encodeURIComponent(fromAgentId)}/chat`,
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              toAgentId,
+              content,
+              createTask,
+              title,
+              ...(isCloud && (settingsPatch || agentsRef.current.length > 0)
+                ? { clientContext: { agents: agentsRef.current, settingsPatch } }
+                : {}),
+            }),
+          }
+        );
+        if (res.snapshot) {
+          if (typeof res.snapshot.cursor === 'number') {
+            cursorRef.current = res.snapshot.cursor;
+          }
+          if (!isCloud) {
+            applySnapshot(res.snapshot);
+          } else {
+            if (res.snapshot.missions) {
+              setMissions(res.snapshot.missions);
+            }
+            if (res.snapshot.tasks) {
+              for (const t of res.snapshot.tasks) applyEvent('task:updated', t);
+            }
+            if (res.snapshot.comms) {
+              for (const c of res.snapshot.comms) applyEvent('comms:message', c);
+            }
+            if (res.snapshot.beams) {
+              setBeams(res.snapshot.beams.filter((b) => b.expiresAt > Date.now()));
+            }
+            if (res.snapshot.agents) setAgents(res.snapshot.agents.map(normalizeAgentZones));
+          }
+        }
+        return res;
+      } catch (err) {
+        const ts = Date.now();
+        setBeams((prev) => prev.filter((b) => b.id !== optBeamId));
+        setAgents((prev) =>
+          prev.map((a) => {
+            if (a.id === fromAgentId && a.speechBubble === optSenderBubble) {
+              return {
+                ...a,
+                speechBubble:
+                  prevSenderBubble && prevSenderBubble.expiresAt > ts ? prevSenderBubble : null,
+              };
+            }
+            if (optReceiverBubble && toAgent && a.id === toAgent.id && a.speechBubble === optReceiverBubble) {
+              return {
+                ...a,
+                speechBubble:
+                  prevReceiverBubble && prevReceiverBubble.expiresAt > ts ? prevReceiverBubble : null,
+              };
+            }
+            return a;
+          })
+        );
+        return handleAuthGuard(err);
+      }
     },
-    [applyEvent]
+    [applyEvent, applySnapshot, markCommandActivity]
   );
 
   const triggerAllHands = useCallback(

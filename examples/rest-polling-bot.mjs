@@ -46,9 +46,12 @@ const peer = {
 const processedTaskIds = new Set();
 const processedCommsIds = new Set();
 let stateCursor = 0;
+let eventsCursor = 0;
+let isServerless = false;
 let registered = false;
 let running = true;
 let sleepTimer = null;
+let activeController = null;
 
 class HttpStatusError extends Error {
   constructor(status, message) {
@@ -58,21 +61,39 @@ class HttpStatusError extends Error {
 }
 
 async function apiRequest(path, options = {}) {
-  const res = await fetch(`${BASE_URL}${path}`, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      'x-muse-token': TOKEN,
-      ...(VERCEL_BYPASS_SECRET ? { 'x-vercel-protection-bypass': VERCEL_BYPASS_SECRET } : {}),
-      ...(options.headers || {}),
-    },
-  });
+  const controller = new AbortController();
+  activeController = controller;
+  try {
+    const res = await fetch(`${BASE_URL}${path}`, {
+      ...options,
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'x-muse-token': TOKEN,
+        ...(VERCEL_BYPASS_SECRET ? { 'x-vercel-protection-bypass': VERCEL_BYPASS_SECRET } : {}),
+        ...(options.headers || {}),
+      },
+    });
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new HttpStatusError(res.status, `HTTP ${res.status} pada ${path}: ${text.slice(0, 200)}`);
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new HttpStatusError(res.status, `HTTP ${res.status} pada ${path}: ${text.slice(0, 200)}`);
+    }
+    return res.json();
+  } finally {
+    if (activeController === controller) {
+      activeController = null;
+    }
   }
-  return res.json();
+}
+
+async function detectServerlessMode() {
+  try {
+    const health = await apiRequest('/api/health');
+    isServerless = Boolean(health?.serverless);
+  } catch {
+    isServerless = false;
+  }
 }
 
 async function sendBridgeEvent(event, payload, eventId) {
@@ -83,6 +104,7 @@ async function sendBridgeEvent(event, payload, eventId) {
 }
 
 async function registerBot(announce = true) {
+  await detectServerlessMode();
   const bootId = Date.now();
   const brainMode = resolveReportedBrainMode(peer, env);
   await sendBridgeEvent(
@@ -118,8 +140,11 @@ async function registerBot(announce = true) {
     processedCommsIds.add(msg.id);
   }
   await processSnapshot(initialState);
+  eventsCursor = stateCursor;
   registered = true;
-  console.log(`[RESTBot] Terdaftar di ${BASE_URL} (${describeBrainMode(peer, env)}, cursor=${stateCursor}).`);
+  console.log(
+    `[RESTBot] Terdaftar di ${BASE_URL} (${describeBrainMode(peer, env)}, mode=${isServerless ? 'serverless-poll' : 'long-poll'}, cursor=${stateCursor}).`
+  );
 }
 
 async function handleTask(task) {
@@ -142,7 +167,7 @@ async function handleTask(task) {
     kind: 'task',
     title: task.title || 'Tugas REST',
     instructions: task.instructions || '',
-    context: '',
+    context: task.context || '',
     fromName: task.assignedById || 'Owner',
   });
 
@@ -181,9 +206,44 @@ async function handleTask(task) {
   );
 }
 
+async function handleIncomingChat(msg) {
+  if (!msg) return false;
+  if (msg.id) {
+    if (processedCommsIds.has(msg.id)) return false;
+    processedCommsIds.add(msg.id);
+  }
+  if (msg.fromId === BOT_ID || msg.kind !== 'chat') return false;
+
+  const contentLower = String(msg.content || '').toLowerCase();
+  const isAddressed =
+    msg.toId === BOT_ID ||
+    contentLower.includes(`@${BOT_ID.toLowerCase()}`) ||
+    contentLower.includes(`@${BOT_NAME.toLowerCase()}`);
+
+  if (!isAddressed) return false;
+
+  const reply = await executeForPeer({
+    peer,
+    env,
+    kind: 'chat',
+    title: 'Chat Ruangan',
+    instructions: msg.content,
+    fromName: msg.fromName || msg.fromId,
+  });
+  if (!reply.failed) {
+    const text = String(reply.result || reply.speech || '').slice(0, 280).trim();
+    if (text) {
+      await sendBridgeEvent('bot:speech', { text, toId: msg.fromId }, `reply-${BOT_ID}-${msg.id || Date.now()}`);
+    }
+  }
+  return true;
+}
+
 async function processSnapshot(snapshot) {
+  let hadActivity = false;
   if (typeof snapshot.cursor === 'number' && snapshot.cursor > stateCursor) {
     stateCursor = snapshot.cursor;
+    eventsCursor = Math.max(eventsCursor, snapshot.cursor);
   }
 
   for (const task of snapshot.tasks || []) {
@@ -193,39 +253,76 @@ async function processSnapshot(snapshot) {
       !processedTaskIds.has(task.id)
     ) {
       processedTaskIds.add(task.id);
+      hadActivity = true;
       await handleTask(task);
     }
   }
 
   for (const msg of snapshot.comms || []) {
-    if (processedCommsIds.has(msg.id)) continue;
-    processedCommsIds.add(msg.id);
-    const contentLower = String(msg.content || '').toLowerCase();
-    const isAddressed =
-      msg.toId === BOT_ID ||
-      contentLower.includes(`@${BOT_ID.toLowerCase()}`) ||
-      contentLower.includes(`@${BOT_NAME.toLowerCase()}`);
+    if (await handleIncomingChat(msg)) {
+      hadActivity = true;
+    }
+  }
+  return hadActivity;
+}
 
-    if (msg.fromId !== BOT_ID && msg.kind !== 'system' && isAddressed) {
-      const reply = await executeForPeer({
-        peer,
-        env,
-        kind: 'chat',
-        title: 'Chat Ruangan',
-        instructions: msg.content,
-        fromName: msg.fromName || msg.fromId,
-      });
-      if (!reply.failed) {
-        const text = String(reply.result || reply.speech || '').slice(0, 280).trim();
-        if (text) {
-          await sendBridgeEvent('bot:speech', { text, toId: msg.fromId }, `reply-${BOT_ID}-${msg.id}`);
-        }
+async function processMailboxInbox(inbox) {
+  let hadActivity = false;
+  if (typeof inbox.cursor === 'number' && inbox.cursor > eventsCursor) {
+    eventsCursor = inbox.cursor;
+    stateCursor = Math.max(stateCursor, inbox.cursor);
+  }
+
+  for (const evt of inbox.events || []) {
+    if (evt.event === 'task:assigned' && evt.payload?.taskId) {
+      const p = evt.payload;
+      if (!processedTaskIds.has(p.taskId)) {
+        processedTaskIds.add(p.taskId);
+        hadActivity = true;
+        await handleTask({
+          id: p.taskId,
+          missionId: p.missionId,
+          title: p.title,
+          instructions: p.instructions,
+          context: p.context || '',
+          assignedById: p.assignedById,
+        });
       }
+    } else if (evt.event === 'comms:message' && evt.payload) {
+      if (await handleIncomingChat(evt.payload)) {
+        hadActivity = true;
+      }
+    }
+  }
+
+  for (const task of inbox.pendingTasks || []) {
+    if (
+      task.assignedToId === BOT_ID &&
+      (task.status === 'assigned' || task.status === 'queued') &&
+      !processedTaskIds.has(task.id)
+    ) {
+      processedTaskIds.add(task.id);
+      hadActivity = true;
+      await handleTask(task);
+    }
+  }
+
+  return hadActivity;
+}
+
+async function sendHeartbeat() {
+  try {
+    await sendBridgeEvent('bot:heartbeat', {});
+  } catch (err) {
+    if (err instanceof HttpStatusError && err.status === 404) {
+      await registerBot(false);
+    } else {
+      throw err;
     }
   }
 }
 
-async function pollOnce() {
+async function pollStateFallback() {
   let snapshot = await apiRequest(`/api/state?since=${stateCursor}`);
   const cursorReset = typeof snapshot.cursor === 'number' && snapshot.cursor < stateCursor;
   const botMissing =
@@ -234,6 +331,7 @@ async function pollOnce() {
   if (cursorReset || botMissing) {
     if (cursorReset) {
       stateCursor = 0;
+      eventsCursor = 0;
     }
     if (botMissing) {
       await registerBot(false);
@@ -246,16 +344,48 @@ async function pollOnce() {
     }
   }
 
-  await processSnapshot(snapshot);
-  try {
-    await sendBridgeEvent('bot:heartbeat', {});
-  } catch (err) {
-    if (err instanceof HttpStatusError && err.status === 404) {
-      await registerBot(false);
-    } else {
-      throw err;
+  const hadActivity = await processSnapshot(snapshot);
+  await sendHeartbeat();
+  return { hadActivity, usedLongPoll: false };
+}
+
+async function pollOnce() {
+  if (!isServerless) {
+    try {
+      const inbox = await apiRequest(
+        `/api/bridge/bots/${encodeURIComponent(BOT_ID)}/events?since=${eventsCursor}&waitMs=15000`
+      );
+      if (typeof inbox.cursor === 'number' && inbox.cursor < eventsCursor) {
+        eventsCursor = 0;
+        stateCursor = 0;
+        const fullState = await apiRequest('/api/state');
+        for (const msg of fullState.comms || []) {
+          processedCommsIds.add(msg.id);
+        }
+        const hadActivity = await processSnapshot(fullState);
+        await sendHeartbeat();
+        return { hadActivity, usedLongPoll: false };
+      }
+      const hadActivity = await processMailboxInbox(inbox);
+      await sendHeartbeat();
+      return { hadActivity, usedLongPoll: true };
+    } catch (err) {
+      if (!running || err?.name === 'AbortError') {
+        throw err;
+      }
+      if (err instanceof HttpStatusError && err.status === 401) {
+        throw err;
+      }
+      if (err instanceof HttpStatusError && err.status === 404) {
+        await registerBot(false);
+        return { hadActivity: true, usedLongPoll: false };
+      }
+      // Fall back to /api/state?since= if long-poll hits a cold serverless error
+      return pollStateFallback();
     }
   }
+
+  return pollStateFallback();
 }
 
 async function main() {
@@ -264,14 +394,25 @@ async function main() {
 
   while (running) {
     let nextWaitMs = POLL_MS;
+    const startedAt = Date.now();
     try {
       if (!registered) {
         await registerBot(true);
+        nextWaitMs = isServerless ? Math.min(1000, POLL_MS) : 50;
       } else {
-        await pollOnce();
+        const result = await pollOnce();
+        const elapsedMs = Date.now() - startedAt;
+        if (result.usedLongPoll && (result.hadActivity || elapsedMs >= 1000)) {
+          nextWaitMs = 50;
+        } else if (isServerless && result.hadActivity) {
+          nextWaitMs = Math.min(1000, POLL_MS);
+        }
       }
       authRetryAttempt = 0;
     } catch (err) {
+      if (!running || err?.name === 'AbortError') {
+        break;
+      }
       if (err instanceof HttpStatusError && err.status === 401) {
         nextWaitMs = computeAuthBackoffMs(authRetryAttempt);
         authRetryAttempt += 1;
@@ -292,6 +433,10 @@ async function main() {
 
 function shutdown() {
   running = false;
+  if (activeController) {
+    activeController.abort();
+    activeController = null;
+  }
   if (sleepTimer) {
     clearTimeout(sleepTimer);
     sleepTimer = null;

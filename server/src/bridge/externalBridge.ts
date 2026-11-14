@@ -939,6 +939,15 @@ export class ExternalBridge {
       const sock = this.botSockets.get(agent.id);
       if (sock && sock.readyState === WebSocket.OPEN) {
         sock.send(JSON.stringify(packet));
+        this.store.touchTaskActivity(task.id);
+        this.store.updateAgent(agent.id, {
+          bridgeConnected: true,
+          currentTaskId: task.id,
+          status: agent.status === 'offline' ? 'working' : agent.status,
+        });
+        if (!agent.speechBubble || agent.speechBubble.expiresAt <= Date.now()) {
+          this.store.setSpeechBubble(agent.id, `Menerima tugas: ${task.title}`, 'command', 5000);
+        }
         return true;
       }
       return false;
@@ -946,6 +955,11 @@ export class ExternalBridge {
 
     if (agent.type === 'external-rest') {
       // REST polling bot picks this up from GET /api/state or GET /api/bridge/bots/:id/events
+      this.store.touchTaskActivity(task.id);
+      this.store.updateAgent(agent.id, {
+        bridgeConnected: true,
+        currentTaskId: task.id,
+      });
       return true;
     }
 
@@ -961,6 +975,9 @@ export class ExternalBridge {
           },
           body: JSON.stringify(packet),
         });
+        if (res.ok) {
+          this.store.touchTaskActivity(task.id);
+        }
         return res.ok;
       } catch (err) {
         console.error(`Webhook delivery failed for ${agent.id}:`, err);

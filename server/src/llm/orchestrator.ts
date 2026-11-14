@@ -1,5 +1,5 @@
 import { BridgeValidationError, ExternalBridge } from '../bridge/externalBridge.js';
-import { WorkspaceStore } from '../store.js';
+import { IS_SERVERLESS, WorkspaceStore } from '../store.js';
 import { Agent, Mission, Task } from '../types.js';
 import {
   LeadPlanResult,
@@ -7,6 +7,9 @@ import {
   executeWorkerTask,
   generateCoordinatorPlan,
   resolveProviderConfig,
+  sanitizeCleanText,
+  sanitizeSpeechText,
+  sanitizeTitleText,
   synthesizeMissionReport,
 } from './providers.js';
 
@@ -102,6 +105,8 @@ export class MissionOrchestrator {
     };
 
     this.store.addMission(mission);
+    this.store.emitBeam('user', target.id, 'Perintah baru', target.color);
+    this.store.setSpeechBubble(target.id, 'Menerima perintah...', 'command', 4500);
     this.store.addComms({
       missionId: mission.id,
       fromId: 'user',
@@ -109,14 +114,16 @@ export class MissionOrchestrator {
       toId: target.id,
       toName: target.name,
       kind: 'command',
-      content: cleanPrompt,
+      content: sanitizeCleanText(cleanPrompt) || cleanPrompt,
     });
 
     if (waitForCompletion) {
       await this.runCoordinatorFlow(mission, target);
     } else {
       // Run asynchronously so HTTP request returns immediately while WebSocket streams live progress
-      void this.runCoordinatorFlow(mission, target);
+      void this.runCoordinatorFlow(mission, target).catch((err) => {
+        console.error('Mission coordinator flow error:', err);
+      });
     }
     return mission;
   }
@@ -129,8 +136,8 @@ export class MissionOrchestrator {
       const directTask = this.createTask({
         missionId: mission.id,
         parentTaskId: null,
-        title: target.canDelegate && target.type !== 'builtin' ? 'Misi / Koordinasi Bot' : 'Tugas Langsung',
-        instructions: mission.prompt,
+        title: target.canDelegate && target.type !== 'builtin' ? 'Misi dan Koordinasi Bot' : 'Tugas Langsung',
+        instructions: sanitizeCleanText(mission.prompt) || mission.prompt,
         assignedToId: target.id,
         assignedById: 'user',
         dependsOnTaskIds: [],
@@ -141,7 +148,7 @@ export class MissionOrchestrator {
     }
 
     this.store.moveAgentToZone(target.id, 'war-room', 0, 'thinking');
-    this.store.setSpeechBubble(target.id, 'Menganalisis perintah & menyusun tim...', 'command', 5000);
+    this.store.setSpeechBubble(target.id, 'Menganalisis perintah dan menyusun tim...', 'command', 5000);
 
     this.store.addComms({
       missionId: mission.id,
@@ -162,14 +169,17 @@ export class MissionOrchestrator {
         settings
       );
     } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
+      const errMsg = sanitizeCleanText(err instanceof Error ? err.message : String(err), {
+        singleLine: true,
+        stripMarkdown: true,
+      });
       this.store.updateMission(mission.id, {
         status: 'failed',
         finalSummary: `### Misi Gagal Dikoordinasikan\n\n${errMsg}`,
         completedAt: new Date().toISOString(),
       });
       this.store.updateAgent(target.id, { status: 'error', currentTaskId: null });
-      this.store.setSpeechBubble(target.id, 'Gagal memanggil Cloud LLM!', 'error', 6000);
+      this.store.setSpeechBubble(target.id, 'Gagal memanggil Cloud LLM.', 'error', 6000);
       this.store.addComms({
         missionId: mission.id,
         fromId: target.id,
@@ -182,10 +192,15 @@ export class MissionOrchestrator {
       return;
     }
 
-    this.store.setSpeechBubble(target.id, plan.speech, 'command', 6000);
+    this.store.setSpeechBubble(
+      target.id,
+      sanitizeSpeechText(plan.speech) || 'Membagikan tugas ke tim.',
+      'command',
+      6000
+    );
 
     if (plan.delegations.length === 0) {
-      const answer = plan.directAnswer || plan.thought;
+      const answer = sanitizeCleanText(plan.directAnswer || plan.thought) || 'Rencana tugas disusun.';
       this.store.updateMission(mission.id, {
         status: 'completed',
         finalSummary: answer,
@@ -211,7 +226,7 @@ export class MissionOrchestrator {
       toId: 'all',
       toName: 'Tim Muse AI',
       kind: 'chat',
-      content: `${plan.thought} (${plan.delegations.length} sub-tugas dibagikan)`,
+      content: `${sanitizeCleanText(plan.thought, { singleLine: true })} (${plan.delegations.length} sub-tugas dibagikan)`,
     });
 
     // First create all tasks so index-based dependency wiring maps cleanly to real task IDs
@@ -221,8 +236,8 @@ export class MissionOrchestrator {
       const task = this.createTask({
         missionId: mission.id,
         parentTaskId: null,
-        title: del.title,
-        instructions: del.instructions,
+        title: sanitizeTitleText(del.title) || 'Tugas Tim',
+        instructions: sanitizeCleanText(del.instructions) || del.instructions,
         assignedToId: del.toAgentId,
         assignedById: target.id,
         dependsOnTaskIds: [],
@@ -252,7 +267,7 @@ export class MissionOrchestrator {
           toId: assignee.id,
           toName: assignee.name,
           kind: 'delegation',
-          content: `[${task.title}] ${task.instructions}`,
+          content: `Delegasi tugas "${task.title}":\n\n${task.instructions}`,
         });
       }
     }
@@ -290,6 +305,7 @@ export class MissionOrchestrator {
     instructions: string;
     missionId?: string;
     parentTaskId?: string | null;
+    waitForCompletion?: boolean;
   }): Promise<Task | null> {
     const fromAgent = this.store.getAgent(params.fromAgentId);
     const toAgent = this.store.getAgent(params.toAgentId);
@@ -356,11 +372,22 @@ export class MissionOrchestrator {
       );
     }
 
+    const rawTitle = sanitizeTitleText(params.title) || 'Tugas Delegasi';
+    const cleanInstructions = sanitizeCleanText(params.instructions) || params.instructions.trim();
+    const inlinePromptSnippet = sanitizeCleanText(params.instructions, {
+      singleLine: true,
+      stripMarkdown: true,
+    }).slice(0, 120);
+    const isDirectOrder = /^(?:order|perintah)\s+langsung$/i.test(rawTitle);
+    const normalizedTitle = isDirectOrder ? 'Perintah langsung' : rawTitle;
+
     let missionId = params.missionId;
     if (!missionId || !this.store.getMission(missionId)) {
       const m = this.store.addMission({
         id: `mission-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
-        prompt: `[Bot Delegation] ${params.title}`,
+        prompt: isDirectOrder
+          ? `Perintah langsung untuk ${toAgent.name}: ${inlinePromptSnippet}`
+          : `Delegasi tugas "${normalizedTitle}" untuk ${toAgent.name}`,
         targetAgentId: fromAgent.id,
         status: 'running',
         createdAt: new Date().toISOString(),
@@ -371,8 +398,8 @@ export class MissionOrchestrator {
     const task = this.createTask({
       missionId,
       parentTaskId: params.parentTaskId ?? null,
-      title: params.title,
-      instructions: params.instructions,
+      title: normalizedTitle,
+      instructions: cleanInstructions,
       assignedToId: toAgent.id,
       assignedById: fromAgent.id,
       dependsOnTaskIds: [],
@@ -381,7 +408,7 @@ export class MissionOrchestrator {
     if (this.isAgentUnavailableOrFallback(toAgent)) {
       const failReason = `Tidak dikerjakan — ${toAgent.name} sedang offline atau belum punya otak (${toAgent.brainMode || 'offline'})`;
       this.store.updateTask(task.id, { status: 'failed', error: failReason });
-      this.store.emitBeam(fromAgent.id, toAgent.id, `Gagal: ${params.title}`, '#ef4444');
+      this.store.emitBeam(fromAgent.id, toAgent.id, `Gagal: ${normalizedTitle}`, '#ef4444');
       this.store.setSpeechBubble(toAgent.id, 'Offline / tanpa otak', 'error', 5000);
       this.store.addComms({
         missionId,
@@ -402,10 +429,10 @@ export class MissionOrchestrator {
       return this.store.getTask(task.id) || task;
     }
 
-    this.store.emitBeam(fromAgent.id, toAgent.id, params.title, fromAgent.color);
+    this.store.emitBeam(fromAgent.id, toAgent.id, normalizedTitle, fromAgent.color);
     this.store.setSpeechBubble(
       fromAgent.id,
-      `@${toAgent.name}, tolong kerjakan: ${params.title}`,
+      sanitizeSpeechText(`@${toAgent.name}, tolong kerjakan: ${normalizedTitle}`),
       'command'
     );
     this.store.addComms({
@@ -415,12 +442,25 @@ export class MissionOrchestrator {
       toId: toAgent.id,
       toName: toAgent.name,
       kind: 'delegation',
-      content: `[${params.title}] ${params.instructions}`,
+      content: isDirectOrder
+        ? `Perintah langsung:\n\n${cleanInstructions}`
+        : `Delegasi tugas "${normalizedTitle}":\n\n${cleanInstructions}`,
     });
 
-    await this.executeTask(task);
+    const waitForCompletion = params.waitForCompletion ?? IS_SERVERLESS;
+    const execPromise = this.executeTask(task);
+    if (toAgent.type === 'builtin' && !waitForCompletion) {
+      void execPromise
+        .then(() => this.checkMissionCompletion(missionId))
+        .catch((err) => {
+          console.error('Delegated task execution error:', err);
+        });
+      return this.store.getTask(task.id) || task;
+    }
+
+    await execPromise;
     await this.checkMissionCompletion(missionId);
-    return task;
+    return this.store.getTask(task.id) || task;
   }
 
   async dispatchReadyTasks(missionId: string): Promise<void> {
@@ -505,11 +545,12 @@ export class MissionOrchestrator {
         return;
       }
 
+      const cleanTitle = sanitizeTitleText(task.title) || task.title;
       const contextStr = depOutputs
-        .map((d) => `${d.agentName} (${d.title}):\n${d.result}`)
+        .map((d) => `${sanitizeCleanText(d.agentName, { singleLine: true })} (${sanitizeTitleText(d.title)}):\n${sanitizeCleanText(d.result)}`)
         .join('\n\n');
       this.store.updateTask(task.id, { status: 'assigned' });
-      this.store.setSpeechBubble(agent.id, `Menerima tugas: ${task.title}`, 'command', 5000);
+      this.store.setSpeechBubble(agent.id, sanitizeSpeechText(`Menerima tugas: ${cleanTitle}`), 'command', 5000);
 
       const delivered = await this.bridge.dispatchTaskToExternalBot(agent, task, contextStr);
       if (delivered) {
@@ -520,7 +561,7 @@ export class MissionOrchestrator {
           toId: agent.id,
           toName: agent.name,
           kind: 'progress',
-          content: `Tugas "${task.title}" dikirim ke bot eksternal ${agent.name} (${agent.type}). Menunggu pengerjaan...`,
+          content: `Tugas "${cleanTitle}" dikirim ke bot eksternal ${agent.name} (${agent.type}). Menunggu pengerjaan...`,
         });
         return; // Will resume when external bot reports task:complete / task:fail
       }
@@ -543,15 +584,16 @@ export class MissionOrchestrator {
     }
 
     // Built-in Cloud LLM agent execution
+    const cleanTitle = sanitizeTitleText(task.title) || task.title;
     this.store.updateTask(task.id, { status: 'working' });
-    this.store.setSpeechBubble(agent.id, `Mengerjakan: ${task.title}`, 'chat', 5000);
+    this.store.setSpeechBubble(agent.id, sanitizeSpeechText(`Mengerjakan: ${cleanTitle}`), 'chat', 5000);
 
     const depth = task.parentTaskId ? 1 : 0;
     try {
       const output = await executeWorkerTask(
         agent,
         mission.prompt,
-        task.title,
+        cleanTitle,
         task.instructions,
         depOutputs,
         this.store.getAgents(),
@@ -559,17 +601,19 @@ export class MissionOrchestrator {
         this.store.getSettings()
       );
 
+      const cleanResult = sanitizeCleanText(output.result) || 'Tugas selesai tanpa catatan tambahan.';
+      const cleanSpeech = sanitizeSpeechText(output.speech) || 'Tugas selesai dikerjakan.';
       this.store.updateTask(task.id, {
         status: 'completed',
-        result: output.result,
+        result: cleanResult,
         completedAt: new Date().toISOString(),
       });
       this.store.updateAgent(agent.id, { currentTaskId: null, status: 'idle' });
-      this.store.setSpeechBubble(agent.id, output.speech, 'report', 6000);
+      this.store.setSpeechBubble(agent.id, cleanSpeech, 'report', 6000);
 
       const coordinator = this.store.getAgent(task.assignedById);
       if (coordinator) {
-        this.store.emitBeam(agent.id, coordinator.id, `Selesai: ${task.title}`, agent.color);
+        this.store.emitBeam(agent.id, coordinator.id, sanitizeTitleText(`Selesai: ${cleanTitle}`), agent.color);
       }
 
       this.store.addComms({
@@ -579,13 +623,16 @@ export class MissionOrchestrator {
         toId: coordinator?.id || 'user',
         toName: coordinator?.name || 'Commander (Owner)',
         kind: 'deliverable',
-        content: output.result,
+        content: cleanResult,
       });
     } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
+      const errMsg = sanitizeCleanText(err instanceof Error ? err.message : String(err), {
+        singleLine: true,
+        stripMarkdown: true,
+      });
       this.store.updateTask(task.id, { status: 'failed', error: errMsg });
       this.store.updateAgent(agent.id, { currentTaskId: null, status: 'error' });
-      this.store.setSpeechBubble(agent.id, 'Cloud LLM error!', 'error', 5000);
+      this.store.setSpeechBubble(agent.id, 'Cloud LLM error.', 'error', 5000);
       this.store.addComms({
         missionId: mission.id,
         fromId: agent.id,
@@ -593,7 +640,7 @@ export class MissionOrchestrator {
         toId: 'all',
         toName: 'All',
         kind: 'error',
-        content: `Tugas "${task.title}" gagal dijalankan (${errMsg}).`,
+        content: `Tugas "${cleanTitle}" gagal dijalankan (${errMsg}).`,
       });
     }
 
@@ -617,10 +664,13 @@ export class MissionOrchestrator {
       return { applied: true, duplicate: true };
     }
 
+    const cleanTitle = sanitizeTitleText(task.title) || task.title;
+    const cleanResult = sanitizeCleanText(result) || 'Selesai tanpa catatan tambahan.';
+    const cleanSpeech = speech ? sanitizeSpeechText(speech) : 'Tugas eksternal selesai.';
     const agent = this.store.getAgent(task.assignedToId);
     this.store.updateTask(taskId, {
       status: 'completed',
-      result,
+      result: cleanResult,
       completedAt: new Date().toISOString(),
     });
 
@@ -629,10 +679,10 @@ export class MissionOrchestrator {
         ...(agent.currentTaskId === taskId ? { currentTaskId: null } : {}),
         status: agent.type === 'external-rest' ? 'online' : 'idle',
       });
-      this.store.setSpeechBubble(agent.id, speech || 'Tugas eksternal selesai!', 'report', 6000);
+      this.store.setSpeechBubble(agent.id, cleanSpeech || 'Tugas eksternal selesai.', 'report', 6000);
       const coordinator = this.store.getAgent(task.assignedById);
       if (coordinator) {
-        this.store.emitBeam(agent.id, coordinator.id, `Selesai: ${task.title}`, agent.color);
+        this.store.emitBeam(agent.id, coordinator.id, sanitizeTitleText(`Selesai: ${cleanTitle}`), agent.color);
       }
       this.store.addComms({
         missionId: task.missionId,
@@ -641,7 +691,7 @@ export class MissionOrchestrator {
         toId: coordinator?.id || 'user',
         toName: coordinator?.name || 'Commander (Owner)',
         kind: 'deliverable',
-        content: result,
+        content: cleanResult,
       });
     }
 
@@ -665,14 +715,17 @@ export class MissionOrchestrator {
       return { applied: true, duplicate: true };
     }
 
+    const cleanTitle = sanitizeTitleText(task.title) || task.title;
+    const cleanError =
+      sanitizeCleanText(error, { singleLine: true, stripMarkdown: true }) || 'Tugas gagal dijalankan.';
     const agent = this.store.getAgent(task.assignedToId);
-    this.store.updateTask(taskId, { status: 'failed', error });
+    this.store.updateTask(taskId, { status: 'failed', error: cleanError });
     if (agent) {
       this.store.updateAgent(agent.id, {
         ...(agent.currentTaskId === taskId ? { currentTaskId: null } : {}),
         status: 'error',
       });
-      this.store.setSpeechBubble(agent.id, 'Tugas gagal!', 'error', 5000);
+      this.store.setSpeechBubble(agent.id, 'Tugas gagal.', 'error', 5000);
       this.store.addComms({
         missionId: task.missionId,
         fromId: agent.id,
@@ -680,7 +733,7 @@ export class MissionOrchestrator {
         toId: 'all',
         toName: 'All',
         kind: 'error',
-        content: `Tugas "${task.title}" gagal: ${error}`,
+        content: `Tugas "${cleanTitle}" gagal: ${cleanError}`,
       });
     }
 
@@ -731,7 +784,7 @@ export class MissionOrchestrator {
 
       let finalSummary = '';
       if (tasks.length === 1 && completedDeliverables.length === 1 && !lead?.canDelegate) {
-        finalSummary = completedDeliverables[0].result;
+        finalSummary = sanitizeCleanText(completedDeliverables[0].result) || completedDeliverables[0].result;
       } else if (lead && completedDeliverables.length > 0) {
         this.store.moveAgentToZone(lead.id, 'war-room', 0, 'thinking');
         this.store.setSpeechBubble(lead.id, 'Menyusun laporan akhir tim...', 'command', 4500);
@@ -741,8 +794,8 @@ export class MissionOrchestrator {
           completedDeliverables,
           this.store.getSettings()
         );
-        finalSummary = synthesis.summary;
-        this.store.setSpeechBubble(lead.id, synthesis.speech, 'report', 6500);
+        finalSummary = sanitizeCleanText(synthesis.summary) || synthesis.summary;
+        this.store.setSpeechBubble(lead.id, sanitizeSpeechText(synthesis.speech) || 'Misi selesai.', 'report', 6500);
         this.store.addComms({
           missionId: mission.id,
           fromId: lead.id,
@@ -755,7 +808,10 @@ export class MissionOrchestrator {
         this.store.moveAgentToZone(lead.id, lead.homeZone, 0, 'idle');
       } else {
         finalSummary = tasks
-          .map((t) => `### ${t.title} (${t.status})\n${t.result || t.error || ''}`)
+          .map((t) => {
+            const detail = sanitizeCleanText(t.result || t.error || 'Tidak ada keluaran.');
+            return `### ${sanitizeTitleText(t.title) || t.title} (${t.status})\n${detail}`;
+          })
           .join('\n\n');
       }
 
@@ -797,7 +853,7 @@ export class MissionOrchestrator {
           toId: 'user',
           toName: 'Commander (Owner)',
           kind: 'error',
-          content: `Tugas "${task.title}" (${agent?.name || task.assignedToId}) ditandai STUCK karena tidak ada kabar progres > ${stuckMinutes} menit. Owner dapat menugaskan ulang atau menandai gagal.`,
+          content: `Tugas "${sanitizeTitleText(task.title) || task.title}" (${agent?.name || task.assignedToId}) ditandai STUCK karena tidak ada kabar progres > ${stuckMinutes} menit. Owner dapat menugaskan ulang atau menandai gagal.`,
         });
       }
     }
@@ -810,6 +866,7 @@ export class MissionOrchestrator {
     if (task.status === 'completed' || task.status === 'failed') {
       return { ok: false, reason: `Tugas sudah berstatus "${task.status}" dan tidak dapat dibatalkan.` };
     }
+    const cleanTitle = sanitizeTitleText(task.title) || task.title;
     const agent = this.store.getAgent(task.assignedToId);
     const updated = this.store.updateTask(taskId, {
       status: 'failed',
@@ -836,7 +893,7 @@ export class MissionOrchestrator {
       toId: agent?.id || 'all',
       toName: agent?.name || task.assignedToId,
       kind: 'error',
-      content: `Owner membatalkan tugas "${task.title}" (${agent?.name || task.assignedToId}).`,
+      content: `Owner membatalkan tugas "${cleanTitle}" (${agent?.name || task.assignedToId}).`,
     });
     await this.dispatchReadyTasks(task.missionId);
     return { ok: true, task: updated };
@@ -851,10 +908,14 @@ export class MissionOrchestrator {
     if (task.status === 'completed' || task.status === 'failed') {
       return { ok: false, reason: `Tugas sudah berstatus "${task.status}".` };
     }
+    const cleanTitle = sanitizeTitleText(task.title) || task.title;
+    const cleanReason =
+      sanitizeCleanText(reason, { singleLine: true, stripMarkdown: true }) ||
+      'Ditandai gagal oleh owner (tugas stuck)';
     const agent = this.store.getAgent(task.assignedToId);
     const updated = this.store.updateTask(taskId, {
       status: 'failed',
-      error: reason,
+      error: cleanReason,
     });
     if (agent && agent.currentTaskId === taskId) {
       this.store.updateAgent(agent.id, {
@@ -874,7 +935,7 @@ export class MissionOrchestrator {
       toId: agent?.id || 'all',
       toName: agent?.name || task.assignedToId,
       kind: 'error',
-      content: `Tugas "${task.title}" ditandai GAGAL oleh owner: ${reason}`,
+      content: `Tugas "${cleanTitle}" ditandai GAGAL oleh owner: ${cleanReason}`,
     });
     await this.dispatchReadyTasks(task.missionId);
     return { ok: true, task: updated };
@@ -936,7 +997,8 @@ export class MissionOrchestrator {
       this.store.updateMission(mission.id, { status: 'running', completedAt: undefined });
     }
 
-    this.store.emitBeam(prevAgent?.id || 'user', nextTarget.id, `Reassign: ${task.title}`, nextTarget.color);
+    const cleanTitle = sanitizeTitleText(task.title) || task.title;
+    this.store.emitBeam(prevAgent?.id || 'user', nextTarget.id, `Penugasan ulang: ${cleanTitle}`, nextTarget.color);
     this.store.addComms({
       missionId: task.missionId,
       fromId: 'user',
@@ -944,7 +1006,7 @@ export class MissionOrchestrator {
       toId: nextTarget.id,
       toName: nextTarget.name,
       kind: 'delegation',
-      content: `Owner menugaskan ulang "${task.title}" ke ${nextTarget.name}.`,
+      content: `Owner menugaskan ulang "${cleanTitle}" ke ${nextTarget.name}.`,
     });
 
     await this.executeTask(updated);

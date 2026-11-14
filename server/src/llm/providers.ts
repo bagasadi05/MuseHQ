@@ -1,5 +1,120 @@
 import { Agent, LLMProvider, RuntimeSettings } from '../types.js';
 
+export interface SanitizeTextOptions {
+  singleLine?: boolean;
+  stripMarkdown?: boolean;
+}
+
+const KNOWN_SYSTEM_TAG_RE =
+  /(?:^[ \t]*|[ \t]+)\[(?:Order langsung|Bot Delegation|Direct Order|Direct Command|Perintah langsung|System|Info|Delegasi|Task|Urgent|Report|Laporan|Alert|Warning)\](?!\()(?!:)[ \t]*/gim;
+const GENERIC_LEADING_TAG_RE = /^[ \t]*\[(?!\s*\])(?!x\])([^\]\n]{1,64})\](?!\()(?!:)[ \t]*/i;
+const BOX_DIVIDER_ONLY_RE = /^[ \t]*[\u2500-\u257F]+(?:[ \t]*[\u2500-\u257F]+)*[ \t]*$/;
+const BOX_TREE_PREFIX_RE =
+  /^([ \t]*)(?:[\u2502\u2503][ \t]*)*[\u251C-\u2523\u2514-\u251B][\u2500-\u257F \t]*(?=\S)/;
+const LEADING_SYMBOL_BULLET_RE =
+  /^([ \t]*)[\u2022\u2023\u2043\u2219\u25AA\u25AB\u25B8\u25B9\u25BA\u25C6\u25C7\u25CB\u25CF\u25E6\u2605\u2606\u2713\u2714\u2717\u2718\u2794\u279C\u27A4\u2192\u21D2]+[ \t]+/;
+const DECORATIVE_SYMBOLS_RE =
+  /(?:[#*0-9]\uFE0F?\u20E3|[\uFE00-\uFE0F\u200B-\u200D]|[\p{Extended_Pictographic}\u{1F1E6}-\u{1F1FF}\u{1F3FB}-\u{1F3FF}\u{E0020}-\u{E007F}]|[\u2022\u2023\u2043\u2219\u2500-\u25FF\u2600-\u27BF\u2B00-\u2BFF])/gu;
+
+const CLEAN_OUTPUT_STYLE_RULE = [
+  'Aturan format wajib:',
+  '- DILARANG KERAS menggunakan emoji, ikon atau piktograf Unicode, karakter box-drawing (garis kotak/pohon), panah Unicode (ganti panah dengan kata "ke"), serta bullet atau tanda centang dekoratif.',
+  '- Tulis dalam Bahasa Indonesia yang bersih, ringkas, dan natural (kecuali user meminta bahasa lain).',
+  '- Untuk laporan atau penjelasan terstruktur, gunakan Markdown standar yang rapi (###, -, **, atau tabel GFM bila relevan).',
+].join('\n');
+
+function stripMarkdownTokens(text: string): string {
+  return text
+    .replace(/```[a-zA-Z0-9_-]*\n?/g, '')
+    .replace(/```/g, '')
+    .replace(/^[ \t]*\|?(?:[ \t]*:?-{3,}:?[ \t]*\|)+[ \t]*(?::?-{3,}:?[ \t]*)?$/gm, '')
+    .replace(/^[ \t]*\|(.*)\|[ \t]*$/gm, (_m, inner: string) =>
+      inner
+        .split('|')
+        .map((c) => c.trim())
+        .filter(Boolean)
+        .join(', ')
+    )
+    .replace(/^[ \t]*#{1,6}[ \t]+/gm, '')
+    .replace(/^[ \t]*>[ \t]?/gm, '')
+    .replace(/^[ \t]*-[ \t]+\[[ xX]\][ \t]+/gm, '- ')
+    .replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, '$1')
+    .replace(/`([^`\n]+)`/g, '$1')
+    .replace(/\*\*([^*\n]+)\*\*/g, '$1')
+    .replace(/(?<![A-Za-z0-9_])__([^_\n]+)__(?![A-Za-z0-9_])/g, '$1')
+    .replace(/~~([^~\n]+)~~/g, '$1')
+    .replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, '$1')
+    .replace(/(?<![A-Za-z0-9_])_([^_\n]+)_(?![A-Za-z0-9_])/g, '$1')
+    .replace(/\*\*/g, '');
+}
+
+/**
+ * Removes decorative Unicode icons/emojis/box-drawing/arrows and noisy bracket tags
+ * while preserving em-dash, en-dash, standard punctuation, and valid Markdown.
+ */
+export function sanitizeCleanText(input: string, opts: SanitizeTextOptions = {}): string {
+  if (typeof input !== 'string') return '';
+  let text = input.replace(/\r\n?/g, '\n');
+
+  text = text.replace(KNOWN_SYSTEM_TAG_RE, (_m, offset: number, full: string) =>
+    offset === 0 || full[offset - 1] === '\n' ? '' : ' '
+  );
+
+  const cleanedLines = text.split('\n').map((rawLine) => {
+    let line = rawLine;
+    if (BOX_DIVIDER_ONLY_RE.test(line)) return '';
+
+    const treeMatch = line.match(BOX_TREE_PREFIX_RE);
+    if (treeMatch) {
+      const hasVerticalPipe = /^[\u2502\u2503]/.test(line.trimStart());
+      const indent = treeMatch[1].length > 0 || hasVerticalPipe ? '  ' : '';
+      line = `${indent}- ${line.slice(treeMatch[0].length)}`;
+    } else {
+      line = line.replace(LEADING_SYMBOL_BULLET_RE, '$1- ');
+    }
+
+    // Replace Unicode arrows cleanly in prose
+    line = line
+      .replace(/(\S)[ \t]*[\u2192\u21D2\u2794\u279C-\u279F\u27A1\u27A4][ \t]*(\S)/g, '$1 ke $2')
+      .replace(/(\S)[ \t]*[\u2194\u21D4][ \t]*(\S)/g, '$1 dan $2')
+      .replace(/(\S)[ \t]*[\u2190\u21D0][ \t]*(\S)/g, '$1 dari $2')
+      .replace(/[\u2190-\u21FF]/g, ' ');
+
+    // Remove decorative symbols, emojis, pictographs, dingbats, and remaining box-drawing chars
+    line = line
+      .replace(/^[ \t]*(?:[#*0-9]\uFE0F?\u20E3|[\p{Extended_Pictographic}\u2022\u2023\u2043\u2219\u2500-\u25FF\u2600-\u27BF\u2B00-\u2BFF\uFE00-\uFE0F\u200B-\u200D])+[ \t]*/gu, '')
+      .replace(DECORATIVE_SYMBOLS_RE, ' ');
+
+    // Collapse multi-spaces inside text while preserving leading list indentation
+    line = line.replace(/(\S)[ \t]{2,}/g, '$1 ').replace(/[ \t]+([.,;:!?])/g, '$1').replace(/[ \t]+$/g, '');
+    return line;
+  });
+
+  text = cleanedLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+
+  if (opts.stripMarkdown) {
+    text = stripMarkdownTokens(text);
+  }
+  if (opts.singleLine) {
+    text = text.replace(/\n+/g, ' ').replace(/[ \t]{2,}/g, ' ').trim();
+  }
+  return text;
+}
+
+export function sanitizeSpeechText(input: string): string {
+  const cleaned = sanitizeCleanText(input, { singleLine: true, stripMarkdown: true })
+    .replace(GENERIC_LEADING_TAG_RE, '')
+    .trim();
+  return cleaned;
+}
+
+export function sanitizeTitleText(input: string): string {
+  const cleaned = sanitizeCleanText(input, { singleLine: true, stripMarkdown: true })
+    .replace(GENERIC_LEADING_TAG_RE, '')
+    .trim();
+  return cleaned;
+}
+
 export interface DelegationProposal {
   toAgentId: string;
   title: string;
@@ -199,21 +314,23 @@ export async function generateCoordinatorPlan(
 Kamu bekerja di dalam MuseHQ Virtual Office bersama tim bot berikut:
 ${availablePeers || '(Belum ada rekan tim aktif lain)'}
 
+${CLEAN_OUTPUT_STYLE_RULE}
+
 Balas HANYA dalam JSON valid dengan skema berikut:
 {
-  "thought": "penjelasan singkat strategi pembagian tugas",
-  "speech": "kalimat pendek <= 80 karakter untuk speech bubble di ruangan kantor",
+  "thought": "penjelasan singkat strategi pembagian tugas tanpa emoji atau simbol dekoratif",
+  "speech": "kalimat pendek <= 80 karakter untuk speech bubble tanpa emoji atau Markdown",
   "delegations": [
     {
       "toAgentId": "id_bot_penerima",
-      "title": "Judul singkat tugas",
-      "instructions": "Instruksi spesifik dan jelas untuk bot tersebut",
+      "title": "Judul singkat tugas yang bersih dan jelas",
+      "instructions": "Instruksi spesifik dalam Bahasa Indonesia dan Markdown rapi untuk bot tersebut",
       "dependsOnIndex": [0]
     }
   ],
-  "directAnswer": "isi hanya jika tidak ada delegasi yang perlu dibuat"
+  "directAnswer": "isi dalam Markdown rapi (###, -, **) hanya jika tidak ada delegasi yang perlu dibuat"
 }
-Gunakan bahasa yang sama dengan prompt user.`;
+Gunakan bahasa yang sama dengan prompt user (utamakan Bahasa Indonesia yang ringkas dan jelas).`;
 
   const raw = await callCloudText(
     resolved.provider,
@@ -238,26 +355,32 @@ Gunakan bahasa yang sama dengan prompt user.`;
     });
     const cleanDelegations = kept.map((d, newIdx) => ({
       ...d,
+      title: sanitizeTitleText(d.title) || 'Tugas Tim',
+      instructions: sanitizeCleanText(d.instructions) || 'Kerjakan tugas sesuai arahan misi.',
       dependsOnIndex: Array.isArray(d.dependsOnIndex)
         ? d.dependsOnIndex
             .map((oldDep) => indexMap.get(oldDep))
             .filter((mapped): mapped is number => mapped !== undefined && mapped !== newIdx)
         : [],
     }));
+    const cleanDirectAnswer =
+      typeof parsed.directAnswer === 'string' && parsed.directAnswer.trim()
+        ? sanitizeCleanText(parsed.directAnswer)
+        : undefined;
     return {
-      thought: parsed.thought || 'Rencana tugas disusun.',
-      speech: parsed.speech || 'Membagikan tugas ke tim sekarang!',
+      thought: sanitizeCleanText(parsed.thought, { singleLine: true }) || 'Rencana tugas disusun.',
+      speech: sanitizeSpeechText(parsed.speech) || 'Membagikan tugas ke tim sekarang.',
       delegations: cleanDelegations,
-      directAnswer: parsed.directAnswer,
+      directAnswer: cleanDirectAnswer,
     };
   }
 
   if (raw.trim()) {
     return {
       thought: 'Menjawab langsung berdasarkan analisis Cloud LLM.',
-      speech: 'Analisis selesai!',
+      speech: 'Analisis selesai.',
       delegations: [],
-      directAnswer: raw.trim(),
+      directAnswer: sanitizeCleanText(raw.trim()),
     };
   }
 
@@ -276,7 +399,10 @@ export async function executeWorkerTask(
 ): Promise<WorkerExecutionResult> {
   const resolved = requireProviderConfig(agent, settings);
   const depContext = dependencyOutputs
-    .map((d) => `### Dari ${d.agentName} (${d.title}):\n${d.result}`)
+    .map(
+      (d) =>
+        `### Dari ${sanitizeCleanText(d.agentName, { singleLine: true })} (${sanitizeTitleText(d.title)}):\n${sanitizeCleanText(d.result)}`
+    )
     .join('\n\n');
 
   const peerList = allowSubDelegation
@@ -288,10 +414,13 @@ export async function executeWorkerTask(
 
   const systemPrompt = `${agent.systemPrompt}
 Peranmu: ${agent.role}.
+
+${CLEAN_OUTPUT_STYLE_RULE}
+
 Balas HANYA dalam JSON valid:
 {
-  "speech": "kalimat singkat <= 75 karakter untuk speech bubble di meja kerjamu",
-  "result": "isi lengkap deliverable dalam format Markdown yang rapi dan actionable"${
+  "speech": "kalimat singkat <= 75 karakter untuk speech bubble tanpa emoji atau Markdown",
+  "result": "isi lengkap deliverable dalam Bahasa Indonesia yang ringkas dengan format Markdown rapi (###, -, **) dan actionable"${
     allowSubDelegation && peerList
       ? `,
   "subDelegations": [
@@ -300,7 +429,7 @@ Balas HANYA dalam JSON valid:
       : ''
   }
 }
-Gunakan bahasa yang sama dengan instruksi.`;
+Gunakan bahasa yang sama dengan instruksi (utamakan Bahasa Indonesia yang jelas dan mudah dibaca).`;
 
   const userPrompt = [
     `Misi Utama: ${missionPrompt}`,
@@ -321,14 +450,24 @@ Gunakan bahasa yang sama dengan instruksi.`;
   );
   const parsed = extractJsonObject<WorkerExecutionResult>(raw);
   if (parsed && typeof parsed.result === 'string' && parsed.result.trim()) {
+    const cleanSubs = Array.isArray(parsed.subDelegations)
+      ? parsed.subDelegations
+          .filter((d) => d && typeof d.toAgentId === 'string' && typeof d.instructions === 'string')
+          .map((d) => ({
+            ...d,
+            title: sanitizeTitleText(d.title) || 'Sub-tugas Delegasi',
+            instructions: sanitizeCleanText(d.instructions),
+          }))
+      : undefined;
     return {
-      speech: parsed.speech || 'Tugas selesai dikerjakan!',
-      result: parsed.result,
-      subDelegations: Array.isArray(parsed.subDelegations) ? parsed.subDelegations : undefined,
+      speech: sanitizeSpeechText(parsed.speech) || 'Tugas selesai dikerjakan.',
+      result: sanitizeCleanText(parsed.result) || 'Tugas selesai tanpa catatan tambahan.',
+      subDelegations: cleanSubs,
     };
   }
-  if (raw.trim()) {
-    return { speech: 'Tugas selesai!', result: raw.trim() };
+  const cleanRaw = sanitizeCleanText(raw);
+  if (cleanRaw) {
+    return { speech: 'Tugas selesai.', result: cleanRaw };
   }
 
   throw new Error(`Model Cloud LLM untuk ${agent.name} mengembalikan output kosong.`);
@@ -340,18 +479,23 @@ export async function synthesizeMissionReport(
   deliverables: Array<{ agentName: string; role: string; title: string; result: string }>,
   settings: RuntimeSettings
 ): Promise<{ speech: string; summary: string }> {
+  const cleanPrompt = sanitizeCleanText(missionPrompt, { singleLine: true, stripMarkdown: true });
   const aggregatedSummary = [
     `# Ringkasan Akhir Misi`,
-    `**Perintah:** ${missionPrompt}`,
+    `**Perintah:** ${cleanPrompt}`,
     '',
-    ...deliverables.map(
-      (d, i) => `### ${i + 1}. ${d.title} — *${d.agentName} (${d.role})*\n${d.result}`
-    ),
+    ...deliverables.map((d, i) => {
+      const cleanTitle = sanitizeTitleText(d.title) || `Tugas ${i + 1}`;
+      const cleanAgent = sanitizeCleanText(d.agentName, { singleLine: true });
+      const cleanRole = sanitizeCleanText(d.role, { singleLine: true });
+      const cleanResult = sanitizeCleanText(d.result);
+      return `### ${i + 1}. ${cleanTitle} — *${cleanAgent} (${cleanRole})*\n${cleanResult}`;
+    }),
   ].join('\n');
 
   if (lead.type !== 'builtin') {
     return {
-      speech: 'Hasil pekerjaan tim eksternal telah terkumpul!',
+      speech: 'Hasil pekerjaan tim eksternal telah terkumpul.',
       summary: aggregatedSummary,
     };
   }
@@ -359,17 +503,21 @@ export async function synthesizeMissionReport(
   const resolved = resolveProviderConfig(lead, settings);
   if (!resolved) {
     return {
-      speech: 'Semua sub-tugas tim selesai!',
+      speech: 'Semua sub-tugas tim selesai.',
       summary: aggregatedSummary,
     };
   }
 
   const systemPrompt = `${lead.systemPrompt}
-Tugasmu sekarang adalah menyusun Ringkasan Eksekutif akhir dalam Markdown berdasarkan hasil kerja seluruh tim. Gabungkan menjadi satu dokumen kohesif, jelas, dan langsung siap dipakai user.`;
+Tugasmu sekarang adalah menyusun Ringkasan Eksekutif akhir dalam Markdown berdasarkan hasil kerja seluruh tim. Gabungkan menjadi satu dokumen kohesif, jelas, dan langsung siap dipakai user.
+${CLEAN_OUTPUT_STYLE_RULE}`;
 
   const body = [
-    `Misi Utama: ${missionPrompt}`,
-    ...deliverables.map((d) => `## Deliverable: ${d.title} (oleh ${d.agentName} - ${d.role})\n${d.result}`),
+    `Misi Utama: ${cleanPrompt}`,
+    ...deliverables.map(
+      (d) =>
+        `## Deliverable: ${sanitizeTitleText(d.title)} (oleh ${sanitizeCleanText(d.agentName, { singleLine: true })} - ${sanitizeCleanText(d.role, { singleLine: true })})\n${sanitizeCleanText(d.result)}`
+    ),
   ].join('\n\n---\n\n');
 
   try {
@@ -381,13 +529,14 @@ Tugasmu sekarang adalah menyusun Ringkasan Eksekutif akhir dalam Markdown berdas
       body,
       false
     );
+    const cleanSummary = sanitizeCleanText(summary);
     return {
-      speech: 'Misi selesai! Laporan akhir siap.',
-      summary: summary.trim() || aggregatedSummary,
+      speech: 'Misi selesai, laporan akhir siap.',
+      summary: cleanSummary || aggregatedSummary,
     };
   } catch {
     return {
-      speech: 'Misi selesai dengan rangkuman tim!',
+      speech: 'Misi selesai dengan rangkuman tim.',
       summary: aggregatedSummary,
     };
   }

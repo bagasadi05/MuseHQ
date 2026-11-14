@@ -221,7 +221,7 @@ export function createApiRouter(
         cleanTargetId,
         IS_SERVERLESS
       );
-      res.status(201).json({ mission });
+      res.status(201).json({ mission, snapshot: store.getSnapshot() });
     } catch (err) {
       if (!res.headersSent) {
         const status =
@@ -475,45 +475,61 @@ export function createApiRouter(
   });
 
   router.post('/agents/:id/chat', requireOwner, async (req, res) => {
-    const { toAgentId, content, createTask, title, clientContext } = req.body as {
-      toAgentId?: string;
-      content?: string;
-      createTask?: boolean;
-      title?: string;
-      clientContext?: {
-        agents?: Agent[];
-        settingsPatch?: Partial<RuntimeSettings>;
+    try {
+      const { toAgentId, content, createTask, title, clientContext } = req.body as {
+        toAgentId?: string;
+        content?: string;
+        createTask?: boolean;
+        title?: string;
+        clientContext?: {
+          agents?: Agent[];
+          settingsPatch?: Partial<RuntimeSettings>;
+        };
       };
-    };
-    if (clientContext) {
-      store.hydrateFromClient(clientContext);
-    }
-    const sender = store.getAgent(req.params.id);
-    if (!sender) {
-      res.status(404).json({ error: 'Bot pengirim tidak ditemukan' });
-      return;
-    }
-    if (typeof content !== 'string' || !content.trim()) {
-      res.status(400).json({ error: 'Pesan tidak boleh kosong' });
-      return;
-    }
+      if (clientContext) {
+        store.hydrateFromClient(clientContext);
+      }
+      const sender = store.getAgent(req.params.id);
+      if (!sender) {
+        res.status(404).json({ error: 'Bot pengirim tidak ditemukan' });
+        return;
+      }
+      if (typeof content !== 'string' || !content.trim()) {
+        res.status(400).json({ error: 'Pesan tidak boleh kosong' });
+        return;
+      }
 
-    if (createTask && toAgentId) {
-      const task = await orchestrator.delegateFromBot({
-        fromAgentId: sender.id,
-        toAgentId,
-        title: title?.trim() || `Perintah dari ${sender.name}`,
-        instructions: content.trim(),
+      const cleanTarget = typeof toAgentId === 'string' && toAgentId.trim() ? toAgentId.trim() : undefined;
+      if (createTask && cleanTarget) {
+        const task = await orchestrator.delegateFromBot({
+          fromAgentId: sender.id,
+          toAgentId: cleanTarget,
+          title: title?.trim() || `Perintah dari ${sender.name}`,
+          instructions: content.trim(),
+          waitForCompletion: IS_SERVERLESS,
+        });
+        if (!task) {
+          res.status(404).json({ error: `Bot penerima "${cleanTarget}" tidak ditemukan` });
+          return;
+        }
+        res.json({ ok: true, task, snapshot: store.getSnapshot() });
+        return;
+      }
+
+      await bridge.processBotEvent(sender.id, 'bot:message', {
+        toAgentId: cleanTarget || 'all',
+        content: content.trim(),
       });
-      res.json({ ok: true, task, snapshot: store.getSnapshot() });
-      return;
+      res.json({ ok: true, snapshot: store.getSnapshot() });
+    } catch (err) {
+      const status =
+        err instanceof BridgeValidationError
+          ? err.statusCode
+          : err instanceof MissionPreconditionError || err instanceof MissingProviderKeyError
+            ? 400
+            : 500;
+      res.status(status).json({ error: err instanceof Error ? err.message : 'Gagal mengirim perintah bot' });
     }
-
-    await bridge.processBotEvent(sender.id, 'bot:message', {
-      toAgentId: toAgentId || 'all',
-      content: content.trim(),
-    });
-    res.json({ ok: true, snapshot: store.getSnapshot() });
   });
 
   router.post('/office/all-hands', requireOwner, (req, res) => {
@@ -573,20 +589,103 @@ export function createApiRouter(
   });
 
   router.get('/bridge/bots/:id/events', noStore, requireBridgeToken, (req, res) => {
+    const botId = req.params.id;
     const parsedSince = Number(req.query.since);
     const since = Number.isFinite(parsedSince) && parsedSince >= 0 ? parsedSince : 0;
-    const agent = store.getAgent(req.params.id);
+    const rawWaitMs = Number(req.query.waitMs);
+    const waitMs =
+      !IS_SERVERLESS && Number.isFinite(rawWaitMs) && rawWaitMs > 0
+        ? Math.min(Math.max(Math.floor(rawWaitMs), 0), 20_000)
+        : 0;
+
+    const agent = store.getAgent(botId);
     if (!agent) {
-      res.status(404).json({ error: `Bot "${req.params.id}" tidak ditemukan` });
+      res.status(404).json({ error: `Bot "${botId}" tidak ditemukan` });
       return;
     }
-    const events = store.getBotOutboxEvents(req.params.id, since);
-    const pendingTasks = store
-      .getSnapshot()
-      .tasks.filter((t) => t.assignedToId === req.params.id && (t.status === 'assigned' || t.status === 'working'));
-    const nextCursor =
-      events.length > 0 ? Math.max(...events.map((e) => e.seq)) : Math.max(since, store.getSnapshot().cursor);
-    res.json({ ok: true, cursor: nextCursor, events, pendingTasks });
+
+    const collectMailbox = () => {
+      const events = store.getBotOutboxEvents(botId, since);
+      const snap = store.getSnapshot();
+      const pendingTasks = snap.tasks.filter(
+        (t) => t.assignedToId === botId && (t.status === 'assigned' || t.status === 'working')
+      );
+      const cursor =
+        events.length > 0 ? Math.max(...events.map((e) => e.seq)) : Math.max(since, snap.cursor);
+      return { events, pendingTasks, cursor };
+    };
+
+    const initial = collectMailbox();
+    if (waitMs <= 0 || initial.events.length > 0 || initial.pendingTasks.length > 0) {
+      res.json({ ok: true, cursor: initial.cursor, events: initial.events, pendingTasks: initial.pendingTasks });
+      return;
+    }
+
+    let settled = false;
+    let checkQueued = false;
+    let unsubscribe = () => {};
+    let timeoutHandle: NodeJS.Timeout | null = null;
+
+    const cleanup = () => {
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+        timeoutHandle = null;
+      }
+      unsubscribe();
+    };
+
+    const finishWithJson = (status: number, body: Record<string, unknown>) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (!res.headersSent && !res.writableEnded) {
+        res.status(status).json(body);
+      }
+    };
+
+    const evaluateWakeup = () => {
+      checkQueued = false;
+      if (settled || res.headersSent || res.writableEnded) return;
+      if (!store.getAgent(botId)) {
+        finishWithJson(404, { error: `Bot "${botId}" tidak ditemukan` });
+        return;
+      }
+      const next = collectMailbox();
+      if (next.events.length > 0 || next.pendingTasks.length > 0) {
+        finishWithJson(200, {
+          ok: true,
+          cursor: next.cursor,
+          events: next.events,
+          pendingTasks: next.pendingTasks,
+        });
+      }
+    };
+
+    unsubscribe = store.subscribe(() => {
+      if (settled || checkQueued) return;
+      checkQueued = true;
+      queueMicrotask(evaluateWakeup);
+    });
+
+    timeoutHandle = setTimeout(() => {
+      const latest = collectMailbox();
+      finishWithJson(200, {
+        ok: true,
+        cursor: latest.cursor,
+        events: latest.events,
+        pendingTasks: latest.pendingTasks,
+      });
+    }, waitMs);
+    timeoutHandle.unref?.();
+
+    const onDisconnect = () => {
+      if (!settled) {
+        settled = true;
+        cleanup();
+      }
+    };
+    req.on('close', onDisconnect);
+    res.on('close', onDisconnect);
   });
 
   router.post('/bridge/register', noStore, requireBridgeToken, (req, res) => {
