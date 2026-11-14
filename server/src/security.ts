@@ -161,6 +161,7 @@ export function getAllowedOrigins(): Set<string> {
   }
 
   for (const envHost of [
+    process.env.RENDER_EXTERNAL_URL,
     process.env.VERCEL_URL,
     process.env.VERCEL_BRANCH_URL,
     process.env.VERCEL_PROJECT_PRODUCTION_URL,

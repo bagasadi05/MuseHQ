@@ -14,7 +14,9 @@ import {
 } from './security.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PORT = Number(process.env.PORT || 3001);
+const parsedPort = Number(process.env.PORT);
+const PORT = Number.isInteger(parsedPort) && parsedPort > 0 ? parsedPort : 3001;
+const HOST = (process.env.HOST || '0.0.0.0').trim() || '0.0.0.0';
 
 const { app, store, bridge, allowedOrigins } = createMuseApp();
 
@@ -72,10 +74,14 @@ server.on('upgrade', (request, socket, head) => {
   }
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, HOST, () => {
   const sec = store.getSecurityStatus();
   const settings = store.getSettings();
-  console.log(`MuseHQ server running at http://localhost:${PORT}`);
+  const externalUrl = process.env.RENDER_EXTERNAL_URL?.trim().replace(/\/+$/, '');
+  console.log(`MuseHQ server running at http://${HOST}:${PORT}`);
+  if (externalUrl) {
+    console.log(`Public URL:    ${externalUrl}`);
+  }
   console.log(`WebSocket UI:  ws://localhost:${PORT}/ws/ui`);
   console.log(`WebSocket Bot: ws://localhost:${PORT}/ws/bot?token=<BOT_BRIDGE_TOKEN>`);
 

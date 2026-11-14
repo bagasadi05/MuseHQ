@@ -132,29 +132,49 @@ BOT_ID=muse-bagas BOT_NAME="Muse Bagas" BOT_HOME_ZONE=command-desk BOT_BRIDGE_TO
 
 ## Deploy ke URL Publik (Agar Bot dari Mesin Lain Bisa Masuk)
 
-`localhost` hanya dapat dijangkau dari komputer yang sama. Agar bot di mesin lain (`muse-bagas`, `muse-arif`, `muse-joni`, `muse-niro`, server Telegram/Discord/n8n) bisa terhubung, deploy backend ke URL publik:
+`localhost` hanya dapat dijangkau dari komputer yang sama. Agar bot nyata dari mesin lain (`muse-bagas`, `muse-arif`, `muse-joni`, `muse-niro`, server Telegram/Discord/n8n) bisa masuk dan berkomunikasi secara konsisten dalam satu proses memori yang sama, deploy backend ke URL publik:
 
-### Opsi A — Server Node.js Selalu Menyala (Direkomendasikan untuk WebSocket `/ws/bot` Penuh)
-Cocok untuk **VPS (Ubuntu + Nginx/Caddy TLS), Railway, Render, atau Fly.io**:
+### Opsi Utama (Direkomendasikan) — Render Paket Gratis (Server Node Persisten via `render.yaml`)
+
+MuseHQ menyertakan Blueprint `render.yaml` siap pakai agar satu proses Node.js memegang seluruh state ruangan secara konsisten dan membuka WebSocket penuh (`/ws/ui` dan `/ws/bot`).
+
+1. **Buat akun Render** di https://render.com lalu login dengan akun GitHub Anda.
+2. **Buat Web Service / Blueprint**:
+   - **Cara cepat (Blueprint):** Klik **New → Blueprint**, pilih repo `bagasadi05/MuseHQ`, lalu Render membaca `render.yaml` otomatis (`runtime: node`, `plan: free`, `NODE_VERSION=24`, `healthCheckPath: /api/health`).
+   - **Cara manual (New → Web Service):**
+     - **Build Command:** `npm run install:all && npm run build` *(JANGAN memakai `npm ci` karena repo ini sengaja tanpa `package-lock.json`)*
+     - **Start Command:** `npm start`
+     - **Health Check Path:** `/api/health`
+3. **Isi Environment Variables** di Dashboard Render (tandai variabel sensitif sebagai secret):
+   - `NODE_VERSION=24`
+   - `BOT_BRIDGE_TOKEN` — token rahasia bridge bot eksternal (min. 8 karakter acak kuat)
+   - `MUSE_OWNER_PASSCODE` — passcode pemilik untuk membuka UI web
+   - `SESSION_SECRET` — secret acak 32+ karakter untuk cookie sesi `muse_session`
+   - `DEFAULT_PROVIDER=gemini` *(atau `openai` / `anthropic` — hanya dipakai bila menambah bot Built-in Cloud LLM)*
+   - `ALLOWED_ORIGINS` — isi dengan URL Render setelah service tercipta (contoh: `https://musehq.onrender.com`; domain `RENDER_EXTERNAL_URL` juga diizinkan otomatis oleh server)
+   - *(Opsional)* `GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` bila ingin menjalankan bot Built-in Cloud LLM selain External Bridge.
+4. **Deploy & Catat URL Publik**:
+   - Tunggu build selesai lalu pastikan `GET https://<nama-service>.onrender.com/api/health` menjawab `{"ok":true,"serverless":false,...}`.
+   - Buka URL di browser lalu login dengan `MUSE_OWNER_PASSCODE`.
+   - Hubungkan bot eksternal menggunakan URL Render tersebut:
+     - **WebSocket penuh:** `MUSE_WS_URL="wss://<nama-service>.onrender.com/ws/bot" BOT_BRIDGE_TOKEN="<TOKEN>" npm run example:bot`
+     - **REST Polling:** `MUSE_BASE_URL="https://<nama-service>.onrender.com" BOT_BRIDGE_TOKEN="<TOKEN>" npm run example:rest-bot`
+
+> **Catatan Batas Paket Gratis Render:**
+> - **Disk Ephemeral:** Filesystem container paket gratis Render bersifat sementara (*ephemeral*), sehingga file `server/data/state.json` (daftar bot tersimpan, riwayat misi, tugas, dan comms) akan ter-reset setiap kali service restart, redeploy, atau bangun dari *spin-down*. *(Saran langkah lanjutan terpisah di luar migrasi ini: mount Render Persistent Disk ke `server/data`, lakukan backup berkala `state.json`, atau pindahkan penyimpanan ke Redis/PostgreSQL eksternal.)*
+> - **Spin-down 15 Menit Saat Idle:** Service paket gratis Render masuk mode tidur jika tidak ada trafik masuk selama ~15 menit; selama ada bot eksternal yang aktif (WebSocket ping/heartbeat atau REST polling berkala), service tetap aktif tanpa terputus ke banyak instance terpisah.
+
+### Opsi Alternatif Self-Hosted — VPS / Railway / Fly.io
 1. Build aplikasi: `npm run install:all && npm run build`.
-2. Atur environment variables:
-   - `BOT_BRIDGE_TOKEN` (token acak kuat)
-   - `MUSE_OWNER_PASSCODE` (passcode pemilik)
-   - `SESSION_SECRET` (string acak 32+ karakter)
-   - `ALLOWED_ORIGINS=https://domain-anda.com`
-3. Jalankan `npm start` (server melayani API, `/ws/ui`, `/ws/bot`, dan static bundle `client/dist`). State tersimpan persisten di disk (`server/data/state.json`).
+2. Atur `PORT`, `BOT_BRIDGE_TOKEN`, `MUSE_OWNER_PASSCODE`, `SESSION_SECRET`, dan `ALLOWED_ORIGINS=https://domain-anda.com`.
+3. Jalankan `npm start` (server mendengarkan `0.0.0.0:$PORT` serta melayani API, `/ws/ui`, `/ws/bot`, dan static bundle `client/dist`).
 
-### Opsi B — Vercel Serverless + REST Polling (`vercel.json` & `api/index.mjs`)
-Cocok untuk deployment cepat tanpa manage VPS:
-1. Import repository ke Vercel (`buildCommand: npm run build`, `outputDirectory: client/dist`, fungsi `api/index.mjs` dengan `maxDuration: 60` dan `includeFiles: server/dist/**`).
-2. Wajib atur Environment Variables di Vercel (**Production & Preview**, tandai sebagai **`Sensitive`**):
-   - `BOT_BRIDGE_TOKEN` (`sensitive`)
-   - `MUSE_OWNER_PASSCODE` (`sensitive`)
-   - `SESSION_SECRET` (`sensitive` — menjaga cookie sesi owner `muse_session` tetap valid lintas *cold start*)
-   - *(Opsional)* `ALLOWED_ORIGINS`, `DEFAULT_PROVIDER`, serta `GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` (tandai `sensitive`) jika memakai Cloud LLM.
-3. Di Vercel Serverless (tanpa WebSocket stateful jangka panjang), UI otomatis berjalan pada mode **Cloud Sync (SSE Streaming)** dan bot eksternal terhubung lewat **REST Polling** (`GET /api/state?since=<cursor>` & `POST /api/bridge/bots/:id/event`):
+### Opsi Cadangan — Vercel Serverless (`vercel.json` & `api/index.mjs`)
+Konfigurasi Vercel (`buildCommand: npm run build`, `outputDirectory: client/dist`, `api/index.mjs`) tetap dipertahankan sebagai opsi cadangan / pratinjau cepat:
+1. Wajib atur `BOT_BRIDGE_TOKEN`, `MUSE_OWNER_PASSCODE`, dan `SESSION_SECRET` (tandai **`Sensitive`**) di Vercel (**Production & Preview**), serta opsional `ALLOWED_ORIGINS`.
+2. Hubungkan bot lewat REST Polling:
    ```bash
    MUSE_BASE_URL="https://domain-vercel-anda.vercel.app" BOT_BRIDGE_TOKEN="<TOKEN>" npm run example:rest-bot
    ```
    *(Opsional: tambahkan `VERCEL_BYPASS_SECRET="<BYPASS_TOKEN>"` untuk preview Vercel yang dilindungi Vercel Protection).*
-   - *Catatan Serverless:* Memori fungsi Lambda/Serverless dan `/tmp` bersifat sementara (*ephemeral*) saat idle/*cold start*; gunakan **Opsi A (Node persisten)** jika Anda membutuhkan bot WebSocket `/ws/bot` tersambung terus-menerus dan persistensi file lokal (`server/data/state.json`) tanpa database eksternal.
+- **Batas Vercel Serverless (Penting):** Setiap instance Lambda Serverless menyimpan state in-memory sendiri tanpa shared KV/Redis dan tidak mendukung koneksi WebSocket `/ws/bot` jangka panjang. Karena state tidak terbagi antar instance, request `bot:hello` atau `task:complete` dari bot eksternal tidak dijamin konsisten pada trafik nyata; Vercel hanya cocok untuk cadangan atau pratinjau cepat, sedangkan produksi stabil untuk banyak bot menggunakan **Opsi Utama (Render / Node persisten)**.

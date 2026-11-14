@@ -159,13 +159,23 @@ export class ExternalBridge {
       this.uiClients.add(ws);
       ws.send(JSON.stringify({ event: 'snapshot', payload: this.store.getSnapshot() }));
 
-      ws.on('error', () => {
-        this.uiClients.delete(ws);
-      });
+      const uiPingTimer = setInterval(() => {
+        if (ws.readyState !== WebSocket.OPEN) return;
+        try {
+          ws.ping();
+        } catch {
+          // Ignore send errors on closing sockets
+        }
+      }, WS_PING_INTERVAL_MS);
+      uiPingTimer.unref?.();
 
-      ws.on('close', () => {
+      const cleanupUi = () => {
+        clearInterval(uiPingTimer);
         this.uiClients.delete(ws);
-      });
+      };
+
+      ws.on('error', cleanupUi);
+      ws.on('close', cleanupUi);
     });
 
     botWss.on('connection', (ws, req) => {

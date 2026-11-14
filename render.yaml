@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: musehq
+    runtime: node
+    plan: free
+    buildCommand: npm run install:all && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: BOT_BRIDGE_TOKEN
+        sync: false
+      - key: MUSE_OWNER_PASSCODE
+        sync: false
+      - key: SESSION_SECRET
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: DEFAULT_PROVIDER
+        value: gemini
+      # Opsional: tambahkan lewat Dashboard Render jika ingin memakai bot Built-in Cloud LLM
+      # - key: GEMINI_API_KEY
+      #   sync: false
+      # - key: OPENAI_API_KEY
+      #   sync: false
+      # - key: ANTHROPIC_API_KEY
+      #   sync: false
