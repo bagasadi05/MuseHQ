@@ -87,8 +87,8 @@ export const RightPanel: React.FC<RightPanelProps> = ({
   const [copiedDeliverableId, setCopiedDeliverableId] = useState<string | null>(null);
 
   // Bot-to-bot manual relay state
-  const [relayFrom, setRelayFrom] = useState('muse-lead');
-  const [relayTo, setRelayTo] = useState('muse-dev');
+  const [relayFrom, setRelayFrom] = useState('');
+  const [relayTo, setRelayTo] = useState('');
   const [relayText, setRelayText] = useState('');
   const [relayAsTask, setRelayAsTask] = useState(true);
   const [relaySending, setRelaySending] = useState(false);
@@ -104,7 +104,8 @@ export const RightPanel: React.FC<RightPanelProps> = ({
       setRelayFrom(agents[0].id);
     }
     if (agents.length > 1 && !agents.some((a) => a.id === relayTo)) {
-      setRelayTo(agents[1].id);
+      const other = agents.find((a) => a.id !== relayFrom) || agents[1];
+      if (other) setRelayTo(other.id);
     }
   }, [agents, relayFrom, relayTo]);
 
@@ -685,7 +686,7 @@ export const RightPanel: React.FC<RightPanelProps> = ({
           className="border-t border-slate-800 bg-slate-950/70 p-2.5"
         >
           <div className="mb-1.5 flex items-center justify-between gap-2 text-[11px] text-slate-400">
-            <span className="font-medium text-slate-300">Simulasi Perintah Antar-Bot:</span>
+            <span className="font-medium text-slate-300">Kirim Perintah / Chat Antar-Bot:</span>
             <label className="flex items-center gap-1 cursor-pointer">
               <input
                 type="checkbox"
@@ -764,7 +765,7 @@ const BotInspector: React.FC<BotInspectorProps> = ({
   const [name, setName] = useState('');
   const [role, setRole] = useState('');
   const [systemPrompt, setSystemPrompt] = useState('');
-  const [provider, setProvider] = useState<LLMProvider>('demo');
+  const [provider, setProvider] = useState<LLMProvider>('gemini');
   const [model, setModel] = useState('');
   const [homeZone, setHomeZone] = useState<ZoneId>('engineering-bay');
   const [canDelegate, setCanDelegate] = useState(false);
@@ -898,16 +899,21 @@ const BotInspector: React.FC<BotInspectorProps> = ({
         <div className="grid grid-cols-2 gap-2">
           <div>
             <label className="mb-1 block text-[11px] text-slate-400">Mesin AI</label>
-            <select
-              value={provider}
-              onChange={(e) => setProvider(e.target.value as LLMProvider)}
-              className="w-full rounded-lg border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs text-slate-100 outline-none"
-            >
-              <option value="demo">Demo / Simulasi</option>
-              <option value="gemini">Google Gemini</option>
-              <option value="openai">OpenAI</option>
-              <option value="anthropic">Anthropic Claude</option>
-            </select>
+            {selectedAgent.type === 'builtin' ? (
+              <select
+                value={provider}
+                onChange={(e) => setProvider(e.target.value as LLMProvider)}
+                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs text-slate-100 outline-none"
+              >
+                <option value="gemini">Google Gemini</option>
+                <option value="openai">OpenAI</option>
+                <option value="anthropic">Anthropic Claude</option>
+              </select>
+            ) : (
+              <div className="rounded-lg border border-purple-500/30 bg-purple-500/10 px-2 py-1.5 font-mono text-[11px] text-purple-200">
+                External Bridge
+              </div>
+            )}
           </div>
           <div>
             <label className="mb-1 block text-[11px] text-slate-400">Meja Utama</label>
@@ -925,7 +931,7 @@ const BotInspector: React.FC<BotInspectorProps> = ({
           </div>
         </div>
 
-        {provider !== 'demo' && selectedAgent.type === 'builtin' && (
+        {selectedAgent.type === 'builtin' && (
           <div>
             <label className="mb-1 block text-[11px] text-slate-400">
               Override Model (opsional)
@@ -980,16 +986,14 @@ const BotInspector: React.FC<BotInspectorProps> = ({
           >
             {savedNotice ? 'Tersimpan!' : 'Simpan Pengaturan'}
           </button>
-          {selectedAgent.id !== 'muse-lead' && (
-            <button
-              type="button"
-              onClick={() => onDeleteAgent(selectedAgent.id)}
-              className="rounded-lg border border-rose-500/35 bg-rose-500/10 p-1.5 text-rose-300 transition hover:bg-rose-500/25 cursor-pointer"
-              title="Hapus bot dari ruangan"
-            >
-              <Trash2 className="h-4 w-4" />
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={() => onDeleteAgent(selectedAgent.id)}
+            className="rounded-lg border border-rose-500/35 bg-rose-500/10 p-1.5 text-rose-300 transition hover:bg-rose-500/25 cursor-pointer"
+            title="Hapus bot dari ruangan"
+          >
+            <Trash2 className="h-4 w-4" />
+          </button>
         </div>
       </form>
     </div>

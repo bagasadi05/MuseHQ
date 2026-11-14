@@ -32,7 +32,7 @@ export const CommandBar: React.FC<CommandBarProps> = ({
   isRunningMission,
 }) => {
   const [prompt, setPrompt] = useState('');
-  const [targetId, setTargetId] = useState('muse-lead');
+  const [targetId, setTargetId] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
   const selectedTarget =
@@ -43,10 +43,10 @@ export const CommandBar: React.FC<CommandBarProps> = ({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const text = prompt.trim();
-    if (!text || submitting) return;
+    if (!text || submitting || !selectedTarget) return;
     setSubmitting(true);
     try {
-      const ok = await onLaunchMission(text, selectedTarget?.id || 'muse-lead');
+      const ok = await onLaunchMission(text, selectedTarget.id);
       if (ok !== false) {
         setPrompt('');
       }
@@ -85,14 +85,21 @@ export const CommandBar: React.FC<CommandBarProps> = ({
           <select
             value={selectedTarget?.id || ''}
             onChange={(e) => setTargetId(e.target.value)}
+            disabled={agents.length === 0}
             aria-label="Target bot penerima perintah"
-            className="bg-transparent text-xs font-medium text-slate-200 outline-none cursor-pointer"
+            className="bg-transparent text-xs font-medium text-slate-200 outline-none disabled:opacity-50 cursor-pointer"
           >
-            {agents.map((a) => (
-              <option key={a.id} value={a.id} className="bg-slate-900 text-slate-100">
-                @{a.name} {a.canDelegate ? '(Auto-Bagi Tugas)' : '(Langsung)'}
+            {agents.length === 0 ? (
+              <option value="" className="bg-slate-900 text-slate-400">
+                Belum ada bot...
               </option>
-            ))}
+            ) : (
+              agents.map((a) => (
+                <option key={a.id} value={a.id} className="bg-slate-900 text-slate-100">
+                  @{a.name} {a.canDelegate ? '(Auto-Bagi Tugas)' : '(Langsung)'}
+                </option>
+              ))
+            )}
           </select>
         </div>
 
@@ -100,13 +107,17 @@ export const CommandBar: React.FC<CommandBarProps> = ({
           type="text"
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
-          placeholder="Berikan perintah ke tim Muse AI... (misal: Riset ide produk & buatkan rencana teknisnya)"
+          placeholder={
+            selectedTarget
+              ? `Berikan perintah ke @${selectedTarget.name}...`
+              : 'Hubungkan bot via External Bridge atau Tambah Bot dulu untuk memberi perintah...'
+          }
           className="min-w-0 flex-1 bg-transparent px-2 py-1.5 text-sm text-slate-100 placeholder-slate-400 outline-none"
         />
 
         <button
           type="submit"
-          disabled={!prompt.trim() || submitting}
+          disabled={!prompt.trim() || submitting || !selectedTarget}
           className="flex items-center justify-center gap-1.5 rounded-xl bg-amber-500 px-4 py-2 text-xs font-semibold text-slate-950 transition hover:bg-amber-400 disabled:cursor-not-allowed disabled:opacity-45 cursor-pointer"
         >
           <Send className="h-3.5 w-3.5" />

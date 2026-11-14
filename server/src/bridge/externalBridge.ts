@@ -477,7 +477,7 @@ export class ExternalBridge {
       description: input.description?.trim() || 'External bot connected via MuseBridge',
       systemPrompt: `External bot (${(input.role || '').trim() || 'Specialist'})`,
       type: input.type,
-      provider: 'demo',
+      provider: this.store.getSettings().defaultProvider,
       model: 'external',
       webhookUrl: validatedWebhook,
       bridgeConnected: true,

@@ -10,6 +10,7 @@ import {
   BridgeQueuedEvent,
   CommandBeam,
   CommsMessage,
+  LLMProvider,
   Mission,
   PublicSettings,
   RuntimeSettings,
@@ -18,6 +19,12 @@ import {
   WorkspaceSnapshot,
   ZoneId,
 } from './types.js';
+
+const VALID_PROVIDERS: ReadonlySet<LLMProvider> = new Set(['gemini', 'openai', 'anthropic']);
+
+function isValidProvider(value: unknown): value is LLMProvider {
+  return typeof value === 'string' && VALID_PROVIDERS.has(value as LLMProvider);
+}
 
 export const IS_SERVERLESS = Boolean(
   process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.NETLIFY
@@ -48,108 +55,6 @@ export interface StartupSecurityStatus {
   settingsFilePath: string;
 }
 
-function createDefaultAgents(defaultProvider: RuntimeSettings['defaultProvider']): Agent[] {
-  const now = new Date().toISOString();
-  const baseConfigs: Array<{
-    id: string;
-    name: string;
-    role: string;
-    description: string;
-    systemPrompt: string;
-    canDelegate: boolean;
-    homeZone: ZoneId;
-    color: string;
-    avatarVariant: Agent['avatarVariant'];
-  }> = [
-    {
-      id: 'muse-lead',
-      name: 'Muse Lead',
-      role: 'Orchestrator & Coordinator',
-      description:
-        'Koordinator misi (bukan pemilik): memecah perintah manusia menjadi sub-tugas terstruktur, mendelegasikan ke bot spesialis maupun bot rekan setara, lalu merangkum hasil akhir.',
-      systemPrompt:
-        'Kamu adalah Muse Lead, koordinator misi di ruang kerja MuseHQ (pemilik adalah manusia/Commander, sedangkan muse-bagas, muse-arif, muse-joni, dan muse-niro adalah rekan setara). Pecah tugas kompleks secara cerdas, delegasikan pekerjaan ke bot spesialis atau rekan yang tepat, dan rangkum laporan akhir dengan jelas.',
-      canDelegate: true,
-      homeZone: 'command-desk',
-      color: '#f59e0b',
-      avatarVariant: 'lead',
-    },
-    {
-      id: 'muse-scout',
-      name: 'Muse Scout',
-      role: 'Research & Strategy Analyst',
-      description:
-        'Mengumpulkan insight, riset kompetitor, kebutuhan user, dan menyusun landasan data untuk tim.',
-      systemPrompt:
-        'Kamu adalah Muse Scout, spesialis riset dan analisis strategi. Berikan temuan terstruktur, poin utama, risiko, dan rekomendasi berbasis konteks misi.',
-      canDelegate: false,
-      homeZone: 'research-library',
-      color: '#06b6d4',
-      avatarVariant: 'researcher',
-    },
-    {
-      id: 'muse-dev',
-      name: 'Muse Dev',
-      role: 'Systems & Code Engineer',
-      description:
-        'Merancang arsitektur teknis, API, struktur data, dan implementasi kode atau otomasi.',
-      systemPrompt:
-        'Kamu adalah Muse Dev, software & AI systems engineer. Buat rancangan teknis yang konkret, bersih, dan siap dieksekusi lengkap dengan struktur komponen atau potongan kode.',
-      canDelegate: false,
-      homeZone: 'engineering-bay',
-      color: '#10b981',
-      avatarVariant: 'coder',
-    },
-    {
-      id: 'muse-craft',
-      name: 'Muse Craft',
-      role: 'Content, UX & Copy Designer',
-      description:
-        'Menulis copywriting, alur UX, narasi produk, serta materi komunikasi yang memikat.',
-      systemPrompt:
-        'Kamu adalah Muse Craft, spesialis UX writing, storytelling, dan desain pengalaman. Ubah temuan teknis dan riset menjadi konsep produk atau copy yang jelas dan menarik.',
-      canDelegate: false,
-      homeZone: 'creative-studio',
-      color: '#ec4899',
-      avatarVariant: 'creative',
-    },
-    {
-      id: 'muse-sentinel',
-      name: 'Muse Sentinel',
-      role: 'QA Reviewer & Validator',
-      description:
-        'Mengaudit kualitas output tim lain, mencari celah logika, dan memastikan deliverable siap dipakai.',
-      systemPrompt:
-        'Kamu adalah Muse Sentinel, QA reviewer yang teliti. Periksa hasil pekerjaan bot lain, identifikasi kekurangan atau edge-case, dan berikan checklist perbaikan.',
-      canDelegate: false,
-      homeZone: 'qa-bench',
-      color: '#3b82f6',
-      avatarVariant: 'qa',
-    },
-  ];
-
-  const occupied: Array<{ x: number; y: number }> = [];
-  return baseConfigs.map((cfg, idx) => {
-    const pos = pickSpotInZone(cfg.homeZone, idx, occupied);
-    occupied.push(pos);
-    return {
-      ...cfg,
-      type: 'builtin',
-      provider: defaultProvider,
-      model: '',
-      bridgeConnected: true,
-      currentZone: cfg.homeZone,
-      targetZone: cfg.homeZone,
-      position: pos,
-      targetPosition: { ...pos },
-      status: 'idle',
-      currentTaskId: null,
-      speechBubble: null,
-      lastSeenAt: now,
-    };
-  });
-}
-
 function maskKey(key: string): string {
   if (!key) return '';
   if (key.length < 16) return '••••••••';
@@ -167,7 +72,7 @@ function createInitialComms(): CommsMessage[] {
       toName: 'All Muse Bots',
       kind: 'system',
       content:
-        'Ruangan kerja MuseHQ aktif. Kirim misi di Command Bar atau sambungkan bot eksternal via External Bridge.',
+        'Ruangan kerja MuseHQ siap. Hubungkan bot Muse nyata via External Bridge atau tambahkan bot Cloud LLM lewat tombol "Tambah Bot".',
       timestamp: new Date().toISOString(),
     },
   ];
@@ -277,11 +182,11 @@ export class WorkspaceStore {
     }
 
     const resolved: RuntimeSettings = {
-      defaultProvider: ['demo', 'gemini', 'openai', 'anthropic'].includes(envProvider)
+      defaultProvider: isValidProvider(envProvider)
         ? envProvider
-        : saved.defaultProvider && ['demo', 'gemini', 'openai', 'anthropic'].includes(saved.defaultProvider)
+        : isValidProvider(saved.defaultProvider)
           ? saved.defaultProvider
-          : 'demo',
+          : 'gemini',
       geminiApiKey: saved.geminiApiKey || process.env.GEMINI_API_KEY || '',
       openaiApiKey: saved.openaiApiKey || process.env.OPENAI_API_KEY || '',
       anthropicApiKey: saved.anthropicApiKey || process.env.ANTHROPIC_API_KEY || '',
@@ -324,29 +229,31 @@ export class WorkspaceStore {
       try {
         const parsed = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) as Partial<PersistedState>;
         const occupied: Array<{ x: number; y: number }> = [];
-        this.agents = (parsed.agents && parsed.agents.length > 0
-          ? parsed.agents
-          : createDefaultAgents(this.settings.defaultProvider)
-        ).map((agent, idx) => {
-          const homeZone = normalizeZoneId(agent.homeZone) || 'coffee-lounge';
-          const isExternalWs = agent.type === 'external-ws';
-          const isRest = agent.type === 'external-rest';
-          const fallbackPos = pickSpotInZone(homeZone, idx, occupied);
-          const sameZonePos = agent.currentZone === homeZone ? agent.position : undefined;
-          occupied.push(fallbackPos);
-          return {
-            ...agent,
-            homeZone,
-            bridgeConnected: isExternalWs ? false : agent.type === 'builtin' || isRest || Boolean(agent.webhookUrl),
-            status: isExternalWs ? 'offline' : isRest ? 'online' : 'idle',
-            currentTaskId: null,
-            speechBubble: null,
-            currentZone: homeZone,
-            targetZone: homeZone,
-            position: sameZonePos ?? fallbackPos,
-            targetPosition: sameZonePos ?? fallbackPos,
-          };
-        });
+        this.agents = (parsed.agents || [])
+          .filter((agent) => !(agent.type === 'builtin' && (agent.provider as string) === 'demo'))
+          .map((agent, idx) => {
+            const homeZone = normalizeZoneId(agent.homeZone) || 'coffee-lounge';
+            const isExternalWs = agent.type === 'external-ws';
+            const isRest = agent.type === 'external-rest';
+            const fallbackPos = pickSpotInZone(homeZone, idx, occupied);
+            const sameZonePos = agent.currentZone === homeZone ? agent.position : undefined;
+            occupied.push(fallbackPos);
+            return {
+              ...agent,
+              provider: isValidProvider(agent.provider)
+                ? agent.provider
+                : this.settings.defaultProvider,
+              homeZone,
+              bridgeConnected: isExternalWs ? false : agent.type === 'builtin' || isRest || Boolean(agent.webhookUrl),
+              status: isExternalWs ? 'offline' : isRest ? 'online' : 'idle',
+              currentTaskId: null,
+              speechBubble: null,
+              currentZone: homeZone,
+              targetZone: homeZone,
+              position: sameZonePos ?? fallbackPos,
+              targetPosition: sameZonePos ?? fallbackPos,
+            };
+          });
         this.missions = (parsed.missions || []).map((m) =>
           m.status === 'running' ? { ...m, status: 'failed' as const } : m
         );
@@ -373,7 +280,7 @@ export class WorkspaceStore {
     }
 
     this.cursor = 1;
-    this.agents = createDefaultAgents(this.settings.defaultProvider);
+    this.agents = [];
     this.comms = createInitialComms();
     this.schedulePersist();
   }
@@ -441,10 +348,7 @@ export class WorkspaceStore {
 
   updateSettings(patch: Partial<RuntimeSettings>): PublicSettings {
     const cleanPatch: Partial<RuntimeSettings> = {};
-    if (
-      patch.defaultProvider &&
-      ['demo', 'gemini', 'openai', 'anthropic'].includes(patch.defaultProvider)
-    ) {
+    if (isValidProvider(patch.defaultProvider)) {
       cleanPatch.defaultProvider = patch.defaultProvider;
     }
     if (typeof patch.geminiApiKey === 'string') cleanPatch.geminiApiKey = patch.geminiApiKey.trim();
@@ -494,7 +398,7 @@ export class WorkspaceStore {
     // Never accept bridgeToken, ownerPasscode, or sessionSecret from clientContext
     if (clientContext.settingsPatch) {
       const p = clientContext.settingsPatch;
-      if (p.defaultProvider && ['demo', 'gemini', 'openai', 'anthropic'].includes(p.defaultProvider)) {
+      if (isValidProvider(p.defaultProvider)) {
         this.settings.defaultProvider = p.defaultProvider;
       }
       if (p.geminiApiKey) this.settings.geminiApiKey = p.geminiApiKey;
@@ -507,7 +411,11 @@ export class WorkspaceStore {
     if (Array.isArray(clientContext.agents) && clientContext.agents.length > 0) {
       for (const incoming of clientContext.agents) {
         if (!incoming?.id) continue;
+        if (incoming.type === 'builtin' && (incoming.provider as string) === 'demo') continue;
         const normalizedZone = normalizeZoneId(incoming.homeZone) || 'engineering-bay';
+        const safeProvider = isValidProvider(incoming.provider)
+          ? incoming.provider
+          : this.settings.defaultProvider;
         const existing = this.getAgent(incoming.id);
         if (existing) {
           Object.assign(existing, {
@@ -515,7 +423,7 @@ export class WorkspaceStore {
             role: incoming.role || existing.role,
             description: incoming.description || existing.description,
             systemPrompt: incoming.systemPrompt || existing.systemPrompt,
-            provider: incoming.provider || existing.provider,
+            provider: safeProvider,
             model: incoming.model ?? existing.model,
             homeZone: normalizedZone,
             canDelegate: incoming.canDelegate ?? existing.canDelegate,
@@ -527,6 +435,7 @@ export class WorkspaceStore {
           const spot = pickSpotInZone(normalizedZone, this.agents.length, this.getOccupiedInZone(normalizedZone));
           this.agents.push({
             ...incoming,
+            provider: safeProvider,
             homeZone: normalizedZone,
             currentZone: normalizedZone,
             targetZone: normalizedZone,
@@ -828,7 +737,7 @@ export class WorkspaceStore {
     this.beams = [];
     this.botOutbox.clear();
     this.processedBridgeEventIds.clear();
-    this.agents = createDefaultAgents(this.settings.defaultProvider);
+    this.agents = [];
     this.comms = createInitialComms();
     this.cursor = 1;
     this.schedulePersist();

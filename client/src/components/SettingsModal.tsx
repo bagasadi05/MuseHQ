@@ -124,11 +124,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               onChange={(e) => setDefaultProvider(e.target.value as LLMProvider)}
               className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-amber-500"
             >
-              <option value="demo">Demo Mode (Simulasi gratis tanpa API Key)</option>
               <option value="gemini">Google Gemini API</option>
               <option value="openai">OpenAI API</option>
               <option value="anthropic">Anthropic Claude API</option>
             </select>
+            <p className="mt-1 text-[11px] text-slate-500">
+              Dipakai untuk bot Built-in Cloud LLM (opsional jika hanya memakai External Bridge).
+            </p>
           </div>
 
           <div className="grid grid-cols-1 gap-3 rounded-xl border border-slate-800 bg-slate-950/60 p-3">
@@ -269,15 +271,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
           )}
 
-          <label className="flex items-center gap-2 text-slate-300 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={applyAll}
-              onChange={(e) => setApplyAll(e.target.checked)}
-              className="accent-amber-500"
-            />
-            <span>Terapkan provider default ini ke semua bot built-in di ruangan</span>
-          </label>
+          {builtinAgents.length > 0 && (
+            <label className="flex items-center gap-2 text-slate-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={applyAll}
+                onChange={(e) => setApplyAll(e.target.checked)}
+                className="accent-amber-500"
+              />
+              <span>Terapkan provider default ini ke semua bot built-in di ruangan</span>
+            </label>
+          )}
 
           {!applyAll && builtinAgents.length > 0 && (
             <div className="space-y-1.5 rounded-xl border border-slate-800 bg-slate-950/60 p-3">
@@ -297,7 +301,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     }
                     className="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-[11px] text-slate-100 outline-none"
                   >
-                    <option value="demo">demo</option>
                     <option value="gemini">gemini</option>
                     <option value="openai">openai</option>
                     <option value="anthropic">anthropic</option>

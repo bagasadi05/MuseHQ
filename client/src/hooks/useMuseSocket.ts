@@ -14,8 +14,8 @@ import {
 export type TransportMode = 'ws' | 'cloud';
 export type AuthStatus = 'checking' | 'locked' | 'setup-required' | 'authenticated';
 
-const CLOUD_CACHE_KEY = 'musehq_cloud_workspace_v2';
-const CLOUD_SETTINGS_KEY = 'musehq_cloud_settings_v2';
+const CLOUD_CACHE_KEY = 'musehq_cloud_workspace_v3';
+const CLOUD_SETTINGS_KEY = 'musehq_cloud_settings_v3';
 
 interface CloudSafePreferences {
   defaultProvider?: PublicSettings['defaultProvider'];
@@ -30,7 +30,7 @@ function pickSafeCloudPreferences(raw: unknown): CloudSafePreferences | null {
   const safe: CloudSafePreferences = {};
   if (
     typeof obj.defaultProvider === 'string' &&
-    ['demo', 'gemini', 'openai', 'anthropic'].includes(obj.defaultProvider)
+    ['gemini', 'openai', 'anthropic'].includes(obj.defaultProvider)
   ) {
     safe.defaultProvider = obj.defaultProvider as PublicSettings['defaultProvider'];
   }
@@ -68,7 +68,7 @@ function loadSafeCloudPreferences(): CloudSafePreferences | null {
 }
 
 const DEFAULT_SETTINGS: PublicSettings = {
-  defaultProvider: 'demo',
+  defaultProvider: 'gemini',
   hasGeminiKey: false,
   hasOpenaiKey: false,
   hasAnthropicKey: false,
@@ -151,7 +151,7 @@ function isColdServerSnapshot(snap: WorkspaceSnapshot): boolean {
     (snap.missions?.length || 0) === 0 &&
     (snap.tasks?.length || 0) === 0 &&
     (snap.comms?.length || 0) <= 1 &&
-    (snap.agents || []).every((a) => a.type === 'builtin')
+    (snap.agents || []).length === 0
   );
 }
 
@@ -173,6 +173,7 @@ export function useMuseSocket() {
   const cursorRef = useRef<number>(1);
   const sseInFlightRef = useRef<boolean>(false);
   const pollInFlightRef = useRef<boolean>(false);
+  const cloudBootedRef = useRef<boolean>(false);
   const agentsRef = useRef<Agent[]>([]);
   agentsRef.current = agents;
 
@@ -252,8 +253,10 @@ export function useMuseSocket() {
     [applySnapshot]
   );
 
-  // Check session state first on initial load
+  // Check session state first on initial load and clean up retired v2 demo cache keys
   useEffect(() => {
+    removeStorage('musehq_cloud_workspace_v2');
+    removeStorage('musehq_cloud_settings_v2');
     let active = true;
     const checkSession = async () => {
       try {
@@ -283,7 +286,13 @@ export function useMuseSocket() {
 
   // Persist cloud workspace state locally ONLY while authenticated in Cloud mode
   useEffect(() => {
-    if (authStatus !== 'authenticated' || transportMode !== 'cloud' || agents.length === 0) return;
+    if (authStatus !== 'authenticated' || transportMode !== 'cloud' || !cloudBootedRef.current) {
+      return;
+    }
+    if (agents.length === 0 && missions.length === 0 && tasks.length === 0) {
+      removeStorage(CLOUD_CACHE_KEY);
+      return;
+    }
     saveJsonStorage(CLOUD_CACHE_KEY, {
       agents,
       missions: missions.slice(-30),
@@ -470,6 +479,8 @@ export function useMuseSocket() {
               settings: safePrefs ? { ...DEFAULT_SETTINGS, ...safePrefs } : DEFAULT_SETTINGS,
             });
           }
+        } finally {
+          cloudBootedRef.current = true;
         }
 
         if (active) {
@@ -614,23 +625,29 @@ export function useMuseSocket() {
         const decoder = new TextDecoder();
         let buffer = '';
 
+        let sseErrorMessage: string | null = null;
+
         const processFrame = (frame: string) => {
           const dataLines = frame
             .split(/\r?\n/)
             .filter((l) => l.startsWith('data: '))
             .map((l) => l.slice(6));
           if (dataLines.length === 0) return;
+          let parsed: { event: string; payload: unknown };
           try {
-            const parsed = JSON.parse(dataLines.join('\n')) as { event: string; payload: unknown };
-            if (parsed.event === 'done') {
-              if (parsed.payload && typeof parsed.payload === 'object') {
-                applySnapshot(parsed.payload as WorkspaceSnapshot);
-              }
-            } else {
-              applyEvent(parsed.event, parsed.payload);
-            }
+            parsed = JSON.parse(dataLines.join('\n')) as { event: string; payload: unknown };
           } catch {
-            // Ignore partial chunk
+            return;
+          }
+          if (parsed.event === 'done') {
+            if (parsed.payload && typeof parsed.payload === 'object') {
+              applySnapshot(parsed.payload as WorkspaceSnapshot);
+            }
+          } else if (parsed.event === 'error') {
+            const msg = (parsed.payload as { message?: string } | null)?.message;
+            sseErrorMessage = msg || 'Gagal menjalankan misi';
+          } else {
+            applyEvent(parsed.event, parsed.payload);
           }
         };
 
@@ -647,6 +664,9 @@ export function useMuseSocket() {
         buffer += decoder.decode();
         if (buffer.trim()) {
           processFrame(buffer);
+        }
+        if (sseErrorMessage) {
+          throw new Error(sseErrorMessage);
         }
         return { ok: true };
       } finally {

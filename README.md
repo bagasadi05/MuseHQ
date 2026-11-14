@@ -2,18 +2,18 @@
 
 **MuseHQ** adalah aplikasi web ruang kerja virtual **2D Isometric** untuk menghubungkan, mengamati, dan mengorkestrasi bot internal maupun bot eksternal (**Muse AI**) di dalam satu kantor virtual yang interaktif.
 
-Di dalam MuseHQ, Anda (Commander / Pemilik) memberi misi lewat Command Bar, lalu `Muse Lead` memecah pekerjaan menjadi sub-tugas berbasis dependensi (**DAG**), mengirimkan pancaran perintah (*command beam*), membiarkan tugas independen berjalan paralel, menyalurkan hasil tugas pendahulu ke tugas dependen, dan menampilkan hasil akhir (*deliverables*) secara *real-time*.
+Di dalam MuseHQ, Anda (Commander / Pemilik) memberi misi lewat Command Bar ke bot koordinator (bot eksternal via External Bridge atau bot Cloud LLM pilihan Anda), melihat pemecahan tugas berbasis dependensi (**DAG**), memantau pancaran perintah (*command beam*), membiarkan tugas independen berjalan paralel, menyalurkan hasil tugas pendahulu ke tugas dependen, dan menampilkan hasil akhir (*deliverables*) secara *real-time*.
 
 ---
 
 ## Arsitektur 3 Lapisan Utama
 
 1. **Multi-Agent Orchestrator & DAG Task Queue (`server/src/llm/orchestrator.ts`)**
-   - Menerima perintah pemilik (`@Muse Lead`, `@all`, atau langsung ke agen tertentu).
+   - Menerima perintah pemilik ke bot koordinator Cloud LLM atau langsung ke bot eksternal via Bridge.
    - Memecah misi menjadi graf sub-tugas dengan `dependsOnTaskIds`:
      - Tugas tanpa dependensi langsung berstatus `working` / `assigned` dan berjalan **paralel**.
      - Tugas dependen berstatus `waiting-dependency` hingga seluruh pendahulunya `completed`, lalu otomatis menerima ringkasan hasil pendahulu sebagai konteks eksekusi.
-   - Mendukung **Demo Simulator** maupun **Cloud LLM API** (`providers.ts`).
+   - Mendukung **External Bot Bridge** maupun **Cloud LLM API** (`gemini`, `openai`, `anthropic` via `providers.ts`) — ruangan dimulai kosong tanpa bot simulator bawaan.
 
 2. **External Bot Bridge (`server/src/bridge/externalBridge.ts`)**
    - Menghubungkan bot nyata dari proses/mesin terpisah ke dalam ruangan yang sama melalui dua protokol:
@@ -61,9 +61,11 @@ npm start
 
 ## Mode AI yang Didukung
 
-- **Demo Simulator (`DEFAULT_PROVIDER=demo`)**: Berjalan langsung tanpa API key apa pun. Cocok untuk menguji alur dekomposisi DAG, animasi ruangan, komunikasi tim, dan integrasi bot eksternal.
+Ruangan MuseHQ dimulai **kosong tanpa bot simulator bawaan** maupun mode Demo Simulator:
+
+- **External Bot Bridge (WebSocket & REST Polling)**: Hubungkan bot Muse nyata Anda (`muse-bagas`, `muse-arif`, `muse-joni`, `muse-niro`, atau agent eksternal lain) langsung ke ruangan tanpa memerlukan API Key LLM di server MuseHQ.
 - **Cloud LLM Asli (`gemini`, `openai`, `anthropic`)**:
-  - Atur langsung melalui menu **API Keys** di header UI (tersimpan aman di runtime settings / state lokal, tidak pernah diekspor mentah ke publik), **atau**
+  - Tambahkan bot Built-in melalui tombol **Tambah Bot**, lalu atur API Key lewat menu **API Keys** di header UI (tersimpan aman di runtime settings / state lokal, tidak pernah diekspor mentah ke publik), **atau**
   - Isi `DEFAULT_PROVIDER`, `GEMINI_API_KEY`, `OPENAI_API_KEY`, atau `ANTHROPIC_API_KEY` di `server/.env` / `.env`.
 
 ---
@@ -77,7 +79,7 @@ Di terminal kedua:
 ```bash
 npm run example:bot
 ```
-`Muse External Ops` (`muse-external-ops`) akan masuk ke zona **QA & Bridge Lab** (`qa-bench`), menyapa tim, lalu siap menerima tugas dari `Muse Lead` dan mengirim hasil kembali via `/ws/bot`.
+`Muse External Ops` (`muse-external-ops`) akan masuk ke zona **QA & Bridge Lab** (`qa-bench`), menyapa tim, lalu siap menerima tugas dari Command Bar atau delegasi bot lain dan mengirim hasil kembali via `/ws/bot`.
 
 ### 2. Mode REST Polling (`examples/rest-polling-bot.mjs`)
 ```bash
@@ -86,7 +88,7 @@ npm run example:rest-bot
 `Muse REST Worker` (`muse-rest-worker`, zona default `qa-bench`, interval `POLL_MS=2500` min `1000`) mendaftar via `POST /api/bridge/bots/muse-rest-worker/event`, membaca `GET /api/state?since=<cursor>`, mengirim `bot:heartbeat` tiap siklus, dan melaporkan hasil tanpa duplikasi saat polling diulang. Jika menargetkan preview Vercel yang diproteksi Deployment Protection, tambahkan `VERCEL_BYPASS_SECRET` (dikirim via header `x-vercel-protection-bypass`).
 
 ### 3. Menghubungkan 4 Agen Rekan Nyata Sekaligus
-Keempat ID agen berikut diperlakukan sebagai **rekan setara** oleh `Muse Lead` (tidak dibatasi kuota delegasi):
+Keempat ID agen berikut diperlakukan sebagai **rekan setara** di ruangan (tidak dibatasi kuota delegasi):
 - `muse-bagas` (disarankan `homeZone: "command-desk"`)
 - `muse-arif` (mis. `research-library` / `engineering-bay`)
 - `muse-joni` (mis. `engineering-bay` / `creative-studio`)
@@ -108,7 +110,7 @@ BOT_ID=muse-bagas BOT_NAME="Muse Bagas" BOT_HOME_ZONE=command-desk BOT_BRIDGE_TO
 | `MUSE_OWNER_PASSCODE` | *(auto-random di lokal)* | Passcode pemilik untuk membuka UI web (`/api/auth/login`) |
 | `SESSION_SECRET` | *(auto-random / derivatif)* | Kunci penandatanganan cookie HMAC `muse_session` |
 | `ALLOWED_ORIGINS` | `http://localhost:5173,http://localhost:3001` | Daftar origin CORS yang diizinkan (pisahkan koma, sertakan skema `http://` atau `https://`) |
-| `DEFAULT_PROVIDER` | `demo` | Provider default: `demo`, `gemini`, `openai`, atau `anthropic` |
+| `DEFAULT_PROVIDER` | `gemini` | Provider default bot Built-in: `gemini`, `openai`, atau `anthropic` |
 | `GEMINI_API_KEY` | — | API Key Google Gemini |
 | `GEMINI_MODEL` | `gemini-2.5-flash` | Model Gemini yang dipakai |
 | `OPENAI_API_KEY` | — | API Key OpenAI |

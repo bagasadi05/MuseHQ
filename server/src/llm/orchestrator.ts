@@ -2,10 +2,20 @@ import { ExternalBridge } from '../bridge/externalBridge.js';
 import { WorkspaceStore } from '../store.js';
 import { Agent, Mission, Task } from '../types.js';
 import {
+  LeadPlanResult,
+  MissingProviderKeyError,
   executeWorkerTask,
   generateCoordinatorPlan,
+  resolveProviderConfig,
   synthesizeMissionReport,
 } from './providers.js';
+
+export class MissionPreconditionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'MissionPreconditionError';
+  }
+}
 
 export class MissionOrchestrator {
   private finalizingMissions = new Set<string>();
@@ -15,21 +25,34 @@ export class MissionOrchestrator {
     private bridge: ExternalBridge
   ) {}
 
-  async startMission(
-    prompt: string,
-    targetAgentId = 'muse-lead',
-    waitForCompletion = false
-  ): Promise<Mission> {
-    const cleanPrompt = prompt.trim();
+  resolveMissionTarget(targetAgentId?: string): Agent {
     const agents = this.store.getAgents();
     const target =
-      this.store.getAgent(targetAgentId) ||
+      (targetAgentId ? this.store.getAgent(targetAgentId) : undefined) ||
       agents.find((a) => a.canDelegate) ||
       agents[0];
 
     if (!target) {
-      throw new Error('Tidak ada bot Muse AI yang terdaftar di ruangan.');
+      throw new MissionPreconditionError(
+        'Belum ada bot Muse AI di ruangan. Hubungkan bot lewat External Bridge atau tambahkan bot Cloud LLM dulu.'
+      );
     }
+
+    const settings = this.store.getSettings();
+    if (target.type === 'builtin' && !resolveProviderConfig(target, settings)) {
+      throw new MissingProviderKeyError(target.provider || settings.defaultProvider);
+    }
+
+    return target;
+  }
+
+  async startMission(
+    prompt: string,
+    targetAgentId?: string,
+    waitForCompletion = false
+  ): Promise<Mission> {
+    const cleanPrompt = prompt.trim();
+    const target = this.resolveMissionTarget(targetAgentId);
 
     const now = new Date().toISOString();
     const mission: Mission = {
@@ -63,12 +86,12 @@ export class MissionOrchestrator {
   private async runCoordinatorFlow(mission: Mission, target: Agent): Promise<void> {
     const settings = this.store.getSettings();
 
-    if (!target.canDelegate) {
-      // Direct single-bot execution
+    if (!target.canDelegate || target.type !== 'builtin') {
+      // Direct single-bot or External Bridge bot execution
       const directTask = this.createTask({
         missionId: mission.id,
         parentTaskId: null,
-        title: 'Tugas Langsung',
+        title: target.canDelegate && target.type !== 'builtin' ? 'Misi / Koordinasi Bot' : 'Tugas Langsung',
         instructions: mission.prompt,
         assignedToId: target.id,
         assignedById: 'user',
@@ -92,12 +115,34 @@ export class MissionOrchestrator {
       content: 'Memetakan kebutuhan misi dan memilih bot spesialis...',
     });
 
-    const plan = await generateCoordinatorPlan(
-      target,
-      mission.prompt,
-      this.store.getAgents(),
-      settings
-    );
+    let plan: LeadPlanResult;
+    try {
+      plan = await generateCoordinatorPlan(
+        target,
+        mission.prompt,
+        this.store.getAgents(),
+        settings
+      );
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      this.store.updateMission(mission.id, {
+        status: 'failed',
+        finalSummary: `### Misi Gagal Dikoordinasikan\n\n${errMsg}`,
+        completedAt: new Date().toISOString(),
+      });
+      this.store.updateAgent(target.id, { status: 'error', currentTaskId: null });
+      this.store.setSpeechBubble(target.id, 'Gagal memanggil Cloud LLM!', 'error', 6000);
+      this.store.addComms({
+        missionId: mission.id,
+        fromId: target.id,
+        fromName: target.name,
+        toId: 'user',
+        toName: 'Commander (Owner)',
+        kind: 'error',
+        content: `Gagal merencanakan misi lewat Cloud LLM: ${errMsg}`,
+      });
+      return;
+    }
 
     this.store.setSpeechBubble(target.id, plan.speech, 'command', 6000);
 
@@ -348,44 +393,60 @@ export class MissionOrchestrator {
       return;
     }
 
-    // Built-in LLM or Demo agent execution
+    // Built-in Cloud LLM agent execution
     this.store.updateTask(task.id, { status: 'working' });
     this.store.setSpeechBubble(agent.id, `Mengerjakan: ${task.title}`, 'chat', 5000);
 
     const depth = task.parentTaskId ? 1 : 0;
-    const output = await executeWorkerTask(
-      agent,
-      mission.prompt,
-      task.title,
-      task.instructions,
-      depOutputs,
-      this.store.getAgents(),
-      depth < 1 && agent.canDelegate,
-      this.store.getSettings()
-    );
+    try {
+      const output = await executeWorkerTask(
+        agent,
+        mission.prompt,
+        task.title,
+        task.instructions,
+        depOutputs,
+        this.store.getAgents(),
+        depth < 1 && agent.canDelegate,
+        this.store.getSettings()
+      );
 
-    this.store.updateTask(task.id, {
-      status: 'completed',
-      result: output.result,
-      completedAt: new Date().toISOString(),
-    });
-    this.store.updateAgent(agent.id, { currentTaskId: null, status: 'idle' });
-    this.store.setSpeechBubble(agent.id, output.speech, 'report', 6000);
+      this.store.updateTask(task.id, {
+        status: 'completed',
+        result: output.result,
+        completedAt: new Date().toISOString(),
+      });
+      this.store.updateAgent(agent.id, { currentTaskId: null, status: 'idle' });
+      this.store.setSpeechBubble(agent.id, output.speech, 'report', 6000);
 
-    const coordinator = this.store.getAgent(task.assignedById);
-    if (coordinator) {
-      this.store.emitBeam(agent.id, coordinator.id, `Selesai: ${task.title}`, agent.color);
+      const coordinator = this.store.getAgent(task.assignedById);
+      if (coordinator) {
+        this.store.emitBeam(agent.id, coordinator.id, `Selesai: ${task.title}`, agent.color);
+      }
+
+      this.store.addComms({
+        missionId: mission.id,
+        fromId: agent.id,
+        fromName: agent.name,
+        toId: coordinator?.id || 'user',
+        toName: coordinator?.name || 'Commander (Owner)',
+        kind: 'deliverable',
+        content: output.result,
+      });
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      this.store.updateTask(task.id, { status: 'failed', error: errMsg });
+      this.store.updateAgent(agent.id, { currentTaskId: null, status: 'error' });
+      this.store.setSpeechBubble(agent.id, 'Cloud LLM error!', 'error', 5000);
+      this.store.addComms({
+        missionId: mission.id,
+        fromId: agent.id,
+        fromName: agent.name,
+        toId: 'all',
+        toName: 'All',
+        kind: 'error',
+        content: `Tugas "${task.title}" gagal dijalankan (${errMsg}).`,
+      });
     }
-
-    this.store.addComms({
-      missionId: mission.id,
-      fromId: agent.id,
-      fromName: agent.name,
-      toId: coordinator?.id || 'user',
-      toName: coordinator?.name || 'Commander (Owner)',
-      kind: 'deliverable',
-      content: output.result,
-    });
 
     await this.dispatchReadyTasks(mission.id);
   }

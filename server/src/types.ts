@@ -20,7 +20,7 @@ export type AgentStatus =
 
 export type AgentType = 'builtin' | 'external-ws' | 'external-rest' | 'external-webhook';
 
-export type LLMProvider = 'demo' | 'gemini' | 'openai' | 'anthropic';
+export type LLMProvider = 'gemini' | 'openai' | 'anthropic';
 
 export type AvatarVariant =
   | 'lead'

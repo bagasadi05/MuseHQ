@@ -12,6 +12,7 @@ import {
   ShieldCheck,
   Wifi,
   WifiOff,
+  X,
 } from 'lucide-react';
 import { AddBotModal } from './components/AddBotModal';
 import { BridgeModal } from './components/BridgeModal';
@@ -60,6 +61,7 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [reportMission, setReportMission] = useState<Mission | null>(null);
   const [toastError, setToastError] = useState<string | null>(null);
+  const [dismissEmptyGuide, setDismissEmptyGuide] = useState(false);
 
   const onlineCount = agents.filter((a) => a.status !== 'offline').length;
   const workingCount = agents.filter(
@@ -101,14 +103,18 @@ export default function App() {
     await Promise.all(builtins.map((a) => updateAgent(a.id, { provider })));
   };
 
-  const providerLabel =
-    settings.defaultProvider === 'demo'
-      ? 'Demo Simulator'
-      : settings.defaultProvider === 'gemini'
-        ? 'Gemini API'
-        : settings.defaultProvider === 'openai'
-          ? 'OpenAI API'
-          : 'Claude API';
+  const hasActiveProviderKey =
+    (settings.defaultProvider === 'gemini' && settings.hasGeminiKey) ||
+    (settings.defaultProvider === 'openai' && settings.hasOpenaiKey) ||
+    (settings.defaultProvider === 'anthropic' && settings.hasAnthropicKey);
+
+  const providerLabel = !hasActiveProviderKey
+    ? 'External Bridge'
+    : settings.defaultProvider === 'gemini'
+      ? 'Gemini API'
+      : settings.defaultProvider === 'openai'
+        ? 'OpenAI API'
+        : 'Claude API';
 
   if (authStatus !== 'authenticated') {
     return (
@@ -320,6 +326,49 @@ SESSION_SECRET=<string-acak-32-karakter>`}
             onLaunchMission={handleLaunchMission}
             isRunningMission={isRunningMission}
           />
+
+          {agents.length === 0 && !dismissEmptyGuide && (
+            <div className="pointer-events-none absolute inset-x-4 top-1/2 z-20 flex -translate-y-1/2 justify-center">
+              <div className="pointer-events-auto relative w-full max-w-md rounded-2xl border border-slate-700/80 bg-slate-900/92 p-5 text-center shadow-2xl shadow-black/60 backdrop-blur-xl">
+                <button
+                  type="button"
+                  onClick={() => setDismissEmptyGuide(true)}
+                  className="absolute top-3 right-3 rounded-lg p-1 text-slate-400 transition hover:bg-slate-800 hover:text-white cursor-pointer"
+                  aria-label="Tutup panduan"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+                <div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-xl border border-purple-500/40 bg-purple-500/15 text-purple-300">
+                  <Plug className="h-5 w-5" />
+                </div>
+                <h2 className="font-display text-sm font-bold text-white">
+                  Ruangan Kerja Kosong — Siap Koneksi Bot Nyata
+                </h2>
+                <p className="mt-1.5 text-xs leading-relaxed text-slate-400">
+                  Tidak ada bot simulator bawaan. Hubungkan Muse nyata Anda via External Bridge
+                  (WebSocket / REST Polling) atau tambahkan bot Cloud LLM (Gemini / OpenAI / Claude).
+                </p>
+                <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowBridge(true)}
+                    className="flex items-center gap-1.5 rounded-xl bg-purple-500 px-3.5 py-2 text-xs font-semibold text-white transition hover:bg-purple-400 cursor-pointer"
+                  >
+                    <Plug className="h-3.5 w-3.5" />
+                    <span>Hubungkan External Bridge</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowAddBot(true)}
+                    className="flex items-center gap-1.5 rounded-xl border border-amber-500/40 bg-amber-500/10 px-3.5 py-2 text-xs font-semibold text-amber-200 transition hover:bg-amber-500/20 cursor-pointer"
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                    <span>Tambah Bot Manual</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
 
           {toastError && (
             <div className="absolute top-14 left-1/2 z-30 -translate-x-1/2 rounded-xl border border-rose-500/50 bg-rose-950/90 px-4 py-2 text-xs font-medium text-rose-200 shadow-xl backdrop-blur-md">

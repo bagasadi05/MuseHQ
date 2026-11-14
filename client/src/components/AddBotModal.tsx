@@ -133,7 +133,6 @@ export const AddBotModal: React.FC<AddBotModalProps> = ({
                 onChange={(e) => setProvider(e.target.value as LLMProvider)}
                 className="w-full rounded-lg border border-slate-700 bg-slate-950 px-2.5 py-2 text-slate-100 outline-none disabled:opacity-45"
               >
-                <option value="demo">Demo / Simulasi</option>
                 <option value="gemini">Google Gemini</option>
                 <option value="openai">OpenAI</option>
                 <option value="anthropic">Anthropic Claude</option>
@@ -215,6 +214,12 @@ export const AddBotModal: React.FC<AddBotModalProps> = ({
               placeholder="Jelaskan cara kerja dan keahlian bot ini saat menerima tugas..."
               className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-amber-500"
             />
+          </div>
+
+          <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-[11px] text-slate-400">
+            {type === 'builtin'
+              ? 'Bot Built-in menggunakan Cloud LLM API. Pastikan API Key provider yang dipilih sudah diisi di menu "API Keys".'
+              : 'Bot External menjalankan AI-nya sendiri melalui External Bridge (tidak membutuhkan API Key di MuseHQ).'}
           </div>
 
           <label className="flex items-center gap-2 text-slate-300 cursor-pointer">

@@ -5,7 +5,8 @@ import {
   normalizeAgentStatus,
   validateWebhookUrl,
 } from '../bridge/externalBridge.js';
-import { MissionOrchestrator } from '../llm/orchestrator.js';
+import { MissionOrchestrator, MissionPreconditionError } from '../llm/orchestrator.js';
+import { MissingProviderKeyError } from '../llm/providers.js';
 import { normalizeZoneId, pickSpotInZone } from '../officeMap.js';
 import {
   SESSION_COOKIE_NAME,
@@ -21,6 +22,8 @@ import {
 } from '../security.js';
 import { IS_SERVERLESS, WorkspaceStore } from '../store.js';
 import { Agent, AgentType, AvatarVariant, LLMProvider, RuntimeSettings, ZoneId } from '../types.js';
+
+const VALID_PROVIDERS: LLMProvider[] = ['gemini', 'openai', 'anthropic'];
 
 export function createApiRouter(
   store: WorkspaceStore,
@@ -143,6 +146,9 @@ export function createApiRouter(
         store.hydrateFromClient(clientContext);
       }
 
+      const cleanTargetId = typeof targetAgentId === 'string' && targetAgentId.trim() ? targetAgentId.trim() : undefined;
+      orchestrator.resolveMissionTarget(cleanTargetId);
+
       const shouldStream = Boolean(stream || req.headers.accept?.includes('text/event-stream'));
       if (shouldStream) {
         res.setHeader('Content-Type', 'text/event-stream');
@@ -159,9 +165,18 @@ export function createApiRouter(
         req.on('close', unsubscribe);
 
         try {
-          await orchestrator.startMission(prompt, typeof targetAgentId === 'string' ? targetAgentId : undefined, true);
+          await orchestrator.startMission(prompt, cleanTargetId, true);
           if (!res.writableEnded) {
             res.write(`data: ${JSON.stringify({ event: 'done', payload: store.getSnapshot() })}\n\n`);
+          }
+        } catch (streamErr) {
+          if (!res.writableEnded) {
+            res.write(
+              `data: ${JSON.stringify({
+                event: 'error',
+                payload: { message: streamErr instanceof Error ? streamErr.message : 'Gagal memulai misi' },
+              })}\n\n`
+            );
           }
         } finally {
           unsubscribe();
@@ -174,13 +189,17 @@ export function createApiRouter(
 
       const mission = await orchestrator.startMission(
         prompt,
-        typeof targetAgentId === 'string' ? targetAgentId : undefined,
+        cleanTargetId,
         IS_SERVERLESS
       );
       res.status(201).json({ mission });
     } catch (err) {
       if (!res.headersSent) {
-        res.status(500).json({ error: err instanceof Error ? err.message : 'Gagal memulai misi' });
+        const status =
+          err instanceof MissionPreconditionError || err instanceof MissingProviderKeyError
+            ? 400
+            : 500;
+        res.status(status).json({ error: err instanceof Error ? err.message : 'Gagal memulai misi' });
       } else {
         res.end();
       }
@@ -222,8 +241,7 @@ export function createApiRouter(
       return;
     }
 
-    const validProviders: LLMProvider[] = ['demo', 'gemini', 'openai', 'anthropic'];
-    if (body.provider !== undefined && !validProviders.includes(body.provider)) {
+    if (body.provider !== undefined && !VALID_PROVIDERS.includes(body.provider)) {
       res.status(400).json({ error: `Provider tidak valid: ${String(body.provider)}` });
       return;
     }
@@ -325,7 +343,7 @@ export function createApiRouter(
     }
 
     if (patch.provider !== undefined) {
-      if (!['demo', 'gemini', 'openai', 'anthropic'].includes(patch.provider)) {
+      if (!VALID_PROVIDERS.includes(patch.provider)) {
         res.status(400).json({ error: `Provider tidak valid: ${String(patch.provider)}` });
         return;
       }
