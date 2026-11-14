@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Check, Copy, Plug, ShieldAlert, X } from 'lucide-react';
 import { Agent } from '../types';
+import { getAgentBrainBadge } from '../utils/brainBadge';
 
 interface BridgeModalProps {
   open: boolean;
@@ -152,22 +153,28 @@ const REAL_AGENTS = [
               </div>
             ) : (
               <div className="flex flex-wrap gap-2 pt-1">
-                {externalBots.map((b) => (
-                  <span
-                    key={b.id}
-                    className="flex items-center gap-1.5 rounded-lg border border-slate-800 bg-slate-900 px-2.5 py-1"
-                  >
+                {externalBots.map((b) => {
+                  const brain = getAgentBrainBadge(b);
+                  return (
                     <span
-                      className={`h-2 w-2 rounded-full ${
-                        b.status === 'offline' ? 'bg-rose-500' : 'bg-emerald-400'
-                      }`}
-                    />
-                    <span className="font-semibold text-slate-200">{b.name}</span>
-                    <span className="text-slate-500">
-                      ({b.id} • {b.type})
+                      key={b.id}
+                      className="flex items-center gap-1.5 rounded-lg border border-slate-800 bg-slate-900 px-2.5 py-1"
+                    >
+                      <span
+                        className={`h-2 w-2 rounded-full ${
+                          b.status === 'offline' ? 'bg-rose-500' : 'bg-emerald-400'
+                        }`}
+                      />
+                      <span className="font-semibold text-slate-200">{b.name}</span>
+                      <span className="text-slate-500">
+                        ({b.id} • {b.type})
+                      </span>
+                      <span className={`rounded border px-1.5 py-0.5 text-[10px] font-medium ${brain.cls}`}>
+                        {brain.label}
+                      </span>
                     </span>
-                  </span>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>

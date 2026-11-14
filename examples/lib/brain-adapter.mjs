@@ -53,10 +53,35 @@ export function resolveBrainConfig(peer, env) {
   return { mode: 'bridge' };
 }
 
+export const NO_BRAIN_FAILURE_MESSAGE =
+  'Tidak dikerjakan — bot ini belum punya otak (belum ada API key / upstream / Muse langsung)';
+
+const VALID_BRAIN_MODES = new Set([
+  'muse-langsung',
+  'gemini',
+  'openai',
+  'anthropic',
+  'upstream',
+  'fallback',
+]);
+
+/** Returns canonical `brainMode` string for `bot:hello` reporting. */
+export function resolveReportedBrainMode(peer, env) {
+  const forced = readPeerEnv(peer, env, 'BRAIN_MODE').trim().toLowerCase();
+  if (forced && VALID_BRAIN_MODES.has(forced) && forced === 'muse-langsung') {
+    return 'muse-langsung';
+  }
+  const cfg = resolveBrainConfig(peer, env);
+  if (cfg.mode === 'bridge') return 'fallback';
+  return cfg.mode;
+}
+
 export function describeBrainMode(peer, env) {
+  const reported = resolveReportedBrainMode(peer, env);
+  if (reported === 'fallback') return 'fallback (Tanpa otak — tidak bisa kerja)';
+  if (reported === 'muse-langsung') return 'muse-langsung';
   const cfg = resolveBrainConfig(peer, env);
   if (cfg.mode === 'upstream') return `upstream (${cfg.upstreamFormat})`;
-  if (cfg.mode === 'bridge') return 'bridge-fallback';
   return `${cfg.mode} (${cfg.model})`;
 }
 
@@ -313,62 +338,56 @@ async function callCloudLlm({ cfg, peer, input }) {
   throw new Error(`Unsupported provider: ${cfg.mode}`);
 }
 
-function buildBridgeFallback({ peer, input, warning }) {
-  if (input.kind === 'chat') {
-    return {
-      speech: `Siap ${input.fromName || 'Pemilik'}, ${peer.name} aktif di ${peer.homeZone}!`,
-      result: `${peer.name} menerima pesan: "${String(input.instructions || '').slice(0, 120)}"`,
-      delegations: [],
-    };
-  }
-
-  const delegations = peer.canDelegate ? extractMentionDelegations(input.instructions, peer.id) : [];
-  const lines = [
-    `#### Laporan External Bridge — ${peer.name} (\`${peer.id}\`)`,
-    `**Peran:** ${peer.role} · **Zona:** \`${peer.homeZone}\``,
-    `**Tugas:** ${input.title}`,
-    `**Instruksi:** ${String(input.instructions || '').slice(0, 220)}`,
-    '',
-    delegations.length > 0
-      ? `- Mendelegasikan tindak lanjut ke: ${delegations.map((d) => `\`${d.toAgentId}\``).join(', ')}.`
-      : '- Tugas diterima melalui jalur real-time `/ws/bot` dan siap dihubungkan ke upstream LLM / endpoint bot Anda.',
-    warning ? `- *Catatan fallback:* ${warning}` : '',
-  ].filter(Boolean);
-
+function buildHonestFailure({ peer, reason, modeUsed }) {
+  const error = reason || NO_BRAIN_FAILURE_MESSAGE;
   return {
-    speech:
-      delegations.length > 0
-        ? `Mengoper sub-tugas ke ${delegations.map((d) => d.toAgentId).join(', ')}`
-        : `${peer.name} menyelesaikan "${input.title}" via Bridge!`,
-    result: lines.join('\n'),
-    delegations,
+    failed: true,
+    error,
+    speech: `${peer.name}: ${error.slice(0, 100)}`,
+    result: '',
+    delegations: [],
+    modeUsed: modeUsed || 'fallback',
   };
 }
 
-/** Execute a task or chat reply via Upstream endpoint, Cloud LLM, or safe Bridge fallback. */
+/** Execute a task or chat reply via Upstream endpoint or Cloud LLM; fallback honestly refuses fake work. */
 export async function executeForPeer({ peer, env, kind, title, instructions, context, fromName }) {
   const cfg = resolveBrainConfig(peer, env);
   const input = { kind, title, instructions, context, fromName };
-  let warning = '';
+
+  if (cfg.mode === 'bridge') {
+    console.warn(`[${peer.id}] Fallback jujur: ${NO_BRAIN_FAILURE_MESSAGE}`);
+    return buildHonestFailure({
+      peer,
+      reason: NO_BRAIN_FAILURE_MESSAGE,
+      modeUsed: 'fallback',
+    });
+  }
 
   try {
     if (cfg.mode === 'upstream') {
       const out = await callUpstream({ cfg, peer, env, input });
-      return { ...out, delegations: normalizeDelegations(out.delegations, peer.id), modeUsed: cfg.mode };
+      return {
+        failed: false,
+        ...out,
+        delegations: normalizeDelegations(out.delegations, peer.id),
+        modeUsed: cfg.mode,
+      };
     }
-    if (cfg.mode !== 'bridge') {
-      const out = await callCloudLlm({ cfg, peer, input });
-      return { ...out, delegations: normalizeDelegations(out.delegations, peer.id), modeUsed: cfg.mode };
-    }
+    const out = await callCloudLlm({ cfg, peer, input });
+    return {
+      failed: false,
+      ...out,
+      delegations: normalizeDelegations(out.delegations, peer.id),
+      modeUsed: cfg.mode,
+    };
   } catch (err) {
-    warning = err instanceof Error ? err.message : String(err);
-    console.warn(`[${peer.id}] Fallback aktif (${cfg.mode} gagal: ${warning.slice(0, 120)})`);
+    const errMsg = err instanceof Error ? err.message : String(err);
+    console.warn(`[${peer.id}] Eksekusi ${cfg.mode} gagal: ${errMsg.slice(0, 140)}`);
+    return buildHonestFailure({
+      peer,
+      reason: `Eksekusi ${cfg.mode} gagal: ${errMsg}`,
+      modeUsed: cfg.mode,
+    });
   }
-
-  const fallback = buildBridgeFallback({ peer, input, warning });
-  return {
-    ...fallback,
-    delegations: normalizeDelegations(fallback.delegations, peer.id),
-    modeUsed: 'bridge',
-  };
 }

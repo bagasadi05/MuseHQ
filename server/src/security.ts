@@ -145,6 +145,123 @@ export function extractBearerOrHeaderToken(req: IncomingMessage): string {
   return '';
 }
 
+export interface BridgeAuthResult {
+  ok: boolean;
+  mode?: 'per-bot' | 'legacy-shared';
+  matchedBotId?: string;
+  deprecatedLegacy?: boolean;
+  forbiddenImpersonation?: boolean;
+  reason?: string;
+}
+
+/**
+ * Parses per-bot bridge token mappings from `BOT_BRIDGE_TOKENS` (JSON object or comma-separated `id=token`)
+ * and `BOT_BRIDGE_TOKEN_<UPPER_ID>` environment variables, discarding empty or placeholder secrets.
+ */
+export function parseBotBridgeTokensFromEnv(
+  env: Record<string, string | undefined> = process.env
+): Record<string, string> {
+  const result: Record<string, string> = {};
+  const rawMap = (env.BOT_BRIDGE_TOKENS || '').trim();
+  if (rawMap) {
+    if (rawMap.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(rawMap) as Record<string, unknown>;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          for (const [rawId, rawTok] of Object.entries(parsed)) {
+            const id = rawId.trim();
+            const tok = typeof rawTok === 'string' ? rawTok.trim() : '';
+            if (id && !isRetiredToken(tok)) {
+              result[id] = tok;
+            }
+          }
+        }
+      } catch {
+        // Ignore malformed JSON map in env
+      }
+    } else {
+      for (const pair of rawMap.split(/[,;\n]/)) {
+        const eq = pair.indexOf('=');
+        if (eq <= 0) continue;
+        const id = pair.slice(0, eq).trim();
+        const tok = pair.slice(eq + 1).trim();
+        if (id && !isRetiredToken(tok)) {
+          result[id] = tok;
+        }
+      }
+    }
+  }
+
+  for (const [key, rawVal] of Object.entries(env)) {
+    if (!key.startsWith('BOT_BRIDGE_TOKEN_')) continue;
+    const suffix = key.slice('BOT_BRIDGE_TOKEN_'.length).trim();
+    const tok = (rawVal || '').trim();
+    if (!suffix || isRetiredToken(tok)) continue;
+    const inferredId = suffix.toLowerCase().replace(/_/g, '-');
+    if (!(inferredId in result)) {
+      result[inferredId] = tok;
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Authenticates a bridge request against configured per-bot tokens first (preventing cross-bot
+ * impersonation), falling back to the deprecated legacy shared token during migration.
+ */
+export function authenticateBridgeToken(
+  suppliedToken: string,
+  botTokens: Record<string, string> | undefined,
+  legacySharedToken: string,
+  claimedBotId?: string
+): BridgeAuthResult {
+  const cleanSupplied = (suppliedToken || '').trim();
+  if (!cleanSupplied || isRetiredToken(cleanSupplied)) {
+    return { ok: false, reason: 'Invalid or missing bridge token' };
+  }
+
+  let matchedBotId: string | undefined;
+  if (botTokens && typeof botTokens === 'object') {
+    for (const [botId, expectedTok] of Object.entries(botTokens)) {
+      if (!expectedTok || isRetiredToken(expectedTok)) continue;
+      if (timingSafeEqualStr(cleanSupplied, expectedTok)) {
+        matchedBotId = botId;
+      }
+    }
+  }
+
+  if (matchedBotId) {
+    if (claimedBotId && claimedBotId !== matchedBotId) {
+      return {
+        ok: false,
+        forbiddenImpersonation: true,
+        matchedBotId,
+        reason: `Token bot ini hanya sah untuk "${matchedBotId}" dan tidak boleh menyamar sebagai "${claimedBotId}"`,
+      };
+    }
+    return { ok: true, mode: 'per-bot', matchedBotId };
+  }
+
+  if (legacySharedToken && !isRetiredToken(legacySharedToken) && timingSafeEqualStr(cleanSupplied, legacySharedToken)) {
+    return { ok: true, mode: 'legacy-shared', deprecatedLegacy: true };
+  }
+
+  return { ok: false, reason: 'Invalid or missing bridge token' };
+}
+
+const loggedLegacyDeprecationKeys = new Set<string>();
+
+/** Logs a one-time deprecation warning for shared legacy token usage without writing any token value. */
+export function logDeprecatedLegacyTokenOnce(contextKey: string): void {
+  const key = contextKey || 'default';
+  if (loggedLegacyDeprecationKeys.has(key)) return;
+  loggedLegacyDeprecationKeys.add(key);
+  console.warn(
+    `[SECURITY][DEPRECATED] Koneksi bridge (${key}) masih memakai BOT_BRIDGE_TOKEN bersama. Segera migrasi ke BOT_BRIDGE_TOKENS per-bot.`
+  );
+}
+
 export function getAllowedOrigins(): Set<string> {
   const port = Number(process.env.PORT || 3001);
   const origins = new Set<string>([

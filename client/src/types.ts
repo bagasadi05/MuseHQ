@@ -22,6 +22,14 @@ export type AgentType = 'builtin' | 'external-ws' | 'external-rest' | 'external-
 
 export type LLMProvider = 'gemini' | 'openai' | 'anthropic';
 
+export type BrainMode =
+  | 'muse-langsung'
+  | 'gemini'
+  | 'openai'
+  | 'anthropic'
+  | 'upstream'
+  | 'fallback';
+
 export type AvatarVariant =
   | 'lead'
   | 'coder'
@@ -50,6 +58,7 @@ export interface Agent {
   type: AgentType;
   provider: LLMProvider;
   model: string;
+  brainMode?: BrainMode;
   webhookUrl?: string;
   bridgeConnected: boolean;
   canDelegate: boolean;
@@ -73,6 +82,7 @@ export type TaskStatus =
   | 'delegated'
   | 'working'
   | 'in-progress'
+  | 'stuck'
   | 'completed'
   | 'failed';
 
@@ -147,6 +157,7 @@ export interface PublicSettings {
   anthropicModel: string;
   hasBridgeToken: boolean;
   bridgeTokenPreview: string;
+  hasPerBotTokens?: boolean;
   authConfigured: boolean;
 }
 
@@ -158,6 +169,7 @@ export interface WorkspaceSnapshot {
   beams: CommandBeam[];
   settings: PublicSettings;
   cursor?: number;
+  stateResetNotice?: string;
 }
 
 export interface ZoneMeta {

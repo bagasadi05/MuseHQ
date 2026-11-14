@@ -3,7 +3,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normalizeZoneId, pickSpotInZone } from './officeMap.js';
-import { deriveDeterministicKey, generateSecureToken, isRetiredToken } from './security.js';
+import {
+  deriveDeterministicKey,
+  generateSecureToken,
+  isRetiredToken,
+  parseBotBridgeTokensFromEnv,
+} from './security.js';
 import {
   Agent,
   AgentStatus,
@@ -31,16 +36,30 @@ export const IS_SERVERLESS = Boolean(
 );
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = IS_SERVERLESS
-  ? path.join(os.tmpdir(), 'muse-hq-data')
-  : path.resolve(__dirname, '..', 'data');
+const ENV_DATA_DIR = (process.env.MUSE_DATA_DIR || '').trim();
+const RENDER_DISK_DIR = '/data';
+const DATA_DIR = ENV_DATA_DIR
+  ? path.resolve(ENV_DATA_DIR)
+  : IS_SERVERLESS
+    ? path.join(os.tmpdir(), 'muse-hq-data')
+    : fs.existsSync(RENDER_DISK_DIR)
+      ? RENDER_DISK_DIR
+      : path.resolve(__dirname, '..', 'data');
 const STATE_FILE = path.join(DATA_DIR, 'state.json');
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
+const BACKUP_DIR = path.join(DATA_DIR, 'backups');
+const MAX_BACKUP_SNAPSHOTS = 24;
+const parsedBackupInterval = Number(process.env.MUSE_BACKUP_INTERVAL_MS);
+const BACKUP_INTERVAL_MS =
+  Number.isFinite(parsedBackupInterval) && parsedBackupInterval > 0
+    ? parsedBackupInterval
+    : 60 * 60_000;
 
 export type BroadcastFn = (event: string, payload: unknown) => void;
 
 interface PersistedState {
   cursor?: number;
+  explicitReset?: boolean;
   agents: Agent[];
   missions: Mission[];
   tasks: Task[];
@@ -92,6 +111,9 @@ export class WorkspaceStore {
   private broadcaster: BroadcastFn = () => {};
   private subscribers = new Set<BroadcastFn>();
   private persistTimer: NodeJS.Timeout | null = null;
+  private backupTimer: NodeJS.Timeout | null = null;
+  private explicitResetFlag = false;
+  private stateResetNotice: string | undefined;
 
   constructor() {
     try {
@@ -103,6 +125,15 @@ export class WorkspaceStore {
     this.settings = loaded.settings;
     this.securityStatus = loaded.securityStatus;
     this.loadState();
+    this.startBackupSchedule();
+  }
+
+  getDataDir(): string {
+    return DATA_DIR;
+  }
+
+  dismissResetNotice(): void {
+    this.stateResetNotice = undefined;
   }
 
   getSecurityStatus(): StartupSecurityStatus {
@@ -181,6 +212,19 @@ export class WorkspaceStore {
         : generateSecureToken('mhq_ses_', 24);
     }
 
+    const envBotTokens = parseBotBridgeTokensFromEnv(process.env);
+    const savedBotTokens: Record<string, string> = {};
+    if (saved.botTokens && typeof saved.botTokens === 'object' && !Array.isArray(saved.botTokens)) {
+      for (const [id, tok] of Object.entries(saved.botTokens)) {
+        const cleanId = id.trim();
+        const cleanTok = typeof tok === 'string' ? tok.trim() : '';
+        if (cleanId && cleanTok && !isRetiredToken(cleanTok)) {
+          savedBotTokens[cleanId] = cleanTok;
+        }
+      }
+    }
+    const mergedBotTokens = { ...savedBotTokens, ...envBotTokens };
+
     const resolved: RuntimeSettings = {
       defaultProvider: isValidProvider(envProvider)
         ? envProvider
@@ -194,6 +238,7 @@ export class WorkspaceStore {
       openaiModel: saved.openaiModel || process.env.OPENAI_MODEL || 'gpt-4o-mini',
       anthropicModel: saved.anthropicModel || process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-5',
       bridgeToken,
+      ...(Object.keys(mergedBotTokens).length > 0 ? { botTokens: mergedBotTokens } : {}),
       ownerPasscode,
       sessionSecret,
     };
@@ -263,11 +308,14 @@ export class WorkspaceStore {
           t.status === 'delegated' ||
           t.status === 'queued' ||
           t.status === 'waiting-dependency' ||
-          t.status === 'assigned'
+          t.status === 'assigned' ||
+          t.status === 'stuck'
             ? { ...t, status: 'failed' as const, error: t.error || 'Server restarted before completion' }
             : t
         );
         this.comms = (parsed.comms || []).slice(-200);
+        this.explicitResetFlag = Boolean(parsed.explicitReset);
+        this.stateResetNotice = undefined;
         this.cursor = Math.max(
           parsed.cursor || 1,
           ...this.comms.map((c) => c.seq || 0),
@@ -282,18 +330,25 @@ export class WorkspaceStore {
     this.cursor = 1;
     this.agents = [];
     this.comms = createInitialComms();
+    this.explicitResetFlag = false;
+    this.stateResetNotice = 'Riwayat hilang karena server restart — bukan karena bot dihapus.';
     this.schedulePersist();
+  }
+
+  private buildPersistedState(): PersistedState {
+    return {
+      cursor: this.cursor,
+      ...(this.explicitResetFlag ? { explicitReset: true } : {}),
+      agents: this.agents,
+      missions: this.missions.slice(-50),
+      tasks: this.tasks.slice(-250),
+      comms: this.comms.slice(-200),
+    };
   }
 
   private writeStateToDisk(): void {
     try {
-      const payload: PersistedState = {
-        cursor: this.cursor,
-        agents: this.agents,
-        missions: this.missions.slice(-50),
-        tasks: this.tasks.slice(-250),
-        comms: this.comms.slice(-200),
-      };
+      const payload = this.buildPersistedState();
       const tmpFile = `${STATE_FILE}.tmp`;
       fs.writeFileSync(tmpFile, JSON.stringify(payload, null, 2), 'utf8');
       fs.renameSync(tmpFile, STATE_FILE);
@@ -302,6 +357,56 @@ export class WorkspaceStore {
         console.error('Failed to persist workspace state:', err);
       }
     }
+  }
+
+  private startBackupSchedule(): void {
+    if (IS_SERVERLESS) return;
+    if (this.backupTimer) {
+      clearInterval(this.backupTimer);
+    }
+    this.backupTimer = setInterval(() => {
+      this.createBackupSnapshot();
+    }, BACKUP_INTERVAL_MS);
+    this.backupTimer.unref?.();
+  }
+
+  /**
+   * Writes an atomic backup snapshot of workspace state into `DATA_DIR/backups/`
+   * and prunes older snapshots to keep only the most recent 24 files.
+   */
+  createBackupSnapshot(): string | null {
+    if (IS_SERVERLESS) return null;
+    try {
+      fs.mkdirSync(BACKUP_DIR, { recursive: true });
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const fileName = `state-${stamp}.json`;
+      const targetPath = path.join(BACKUP_DIR, fileName);
+      const tmpPath = `${targetPath}.tmp`;
+      fs.writeFileSync(tmpPath, JSON.stringify(this.buildPersistedState(), null, 2), 'utf8');
+      fs.renameSync(tmpPath, targetPath);
+
+      const files = fs
+        .readdirSync(BACKUP_DIR)
+        .filter((f) => /^state-.*\.json$/.test(f))
+        .sort();
+      while (files.length > MAX_BACKUP_SNAPSHOTS) {
+        const oldest = files.shift();
+        if (oldest) {
+          fs.unlinkSync(path.join(BACKUP_DIR, oldest));
+        }
+      }
+      return targetPath;
+    } catch {
+      return null;
+    }
+  }
+
+  dispose(): void {
+    if (this.backupTimer) {
+      clearInterval(this.backupTimer);
+      this.backupTimer = null;
+    }
+    this.flushPersist();
   }
 
   private schedulePersist(): void {
@@ -342,6 +447,7 @@ export class WorkspaceStore {
       anthropicModel: this.settings.anthropicModel,
       hasBridgeToken: Boolean(this.settings.bridgeToken),
       bridgeTokenPreview: maskKey(this.settings.bridgeToken),
+      hasPerBotTokens: Object.keys(this.settings.botTokens || {}).length > 0,
       authConfigured: Boolean(this.settings.ownerPasscode),
     };
   }
@@ -371,6 +477,19 @@ export class WorkspaceStore {
         throw new Error('Token bridge tidak memenuhi syarat keamanan minimum (minimal 8 karakter unik).');
       }
       cleanPatch.bridgeToken = nextToken;
+    }
+    if (patch.botTokens && typeof patch.botTokens === 'object' && !Array.isArray(patch.botTokens)) {
+      const nextBotTokens: Record<string, string> = {};
+      for (const [id, tok] of Object.entries(patch.botTokens)) {
+        const cleanId = id.trim();
+        const cleanTok = typeof tok === 'string' ? tok.trim() : '';
+        if (!cleanId) continue;
+        if (isRetiredToken(cleanTok)) {
+          throw new Error(`Token untuk bot "${cleanId}" tidak memenuhi syarat keamanan minimum.`);
+        }
+        nextBotTokens[cleanId] = cleanTok;
+      }
+      cleanPatch.botTokens = nextBotTokens;
     }
     if (typeof patch.ownerPasscode === 'string' && patch.ownerPasscode.trim()) {
       const nextPass = patch.ownerPasscode.trim();
@@ -473,6 +592,9 @@ export class WorkspaceStore {
       beams: this.beams,
       settings: this.getPublicSettings(),
       cursor: this.cursor,
+      ...(this.stateResetNotice && this.missions.length === 0
+        ? { stateResetNotice: this.stateResetNotice }
+        : {}),
     };
   }
 
@@ -636,6 +758,8 @@ export class WorkspaceStore {
   }
 
   addMission(mission: Mission): Mission {
+    this.explicitResetFlag = false;
+    this.stateResetNotice = undefined;
     this.missions.push(mission);
     this.schedulePersist();
     this.emit('mission:updated', mission);
@@ -681,6 +805,17 @@ export class WorkspaceStore {
 
   getTask(id: string): Task | undefined {
     return this.tasks.find((t) => t.id === id);
+  }
+
+  getAllTasks(): Task[] {
+    return this.tasks;
+  }
+
+  touchTaskActivity(id: string): void {
+    const task = this.tasks.find((t) => t.id === id);
+    if (!task) return;
+    task.updatedAt = new Date().toISOString();
+    this.schedulePersist();
   }
 
   getTasksByMission(missionId: string): Task[] {
@@ -740,6 +875,8 @@ export class WorkspaceStore {
     this.agents = [];
     this.comms = createInitialComms();
     this.cursor = 1;
+    this.explicitResetFlag = true;
+    this.stateResetNotice = undefined;
     this.schedulePersist();
     const snap = this.getSnapshot();
     this.emit('snapshot', snap);

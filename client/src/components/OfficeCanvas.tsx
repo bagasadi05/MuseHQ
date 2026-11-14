@@ -379,6 +379,23 @@ function drawPixelBot(
   ctx.textAlign = 'center';
   ctx.fillText(shortRole, sx, pillY + 23.5);
 
+  if (agent.brainMode) {
+    const isFallback = agent.brainMode === 'fallback';
+    const brainTag = isFallback ? 'Tanpa otak' : agent.brainMode;
+    ctx.font = '600 7.5px "JetBrains Mono", monospace';
+    const brainW = ctx.measureText(brainTag).width + 10;
+    ctx.fillStyle = isFallback
+      ? 'rgba(225, 29, 72, 0.9)'
+      : agent.brainMode === 'muse-langsung'
+        ? 'rgba(8, 145, 178, 0.85)'
+        : 'rgba(15, 23, 42, 0.85)';
+    ctx.beginPath();
+    ctx.roundRect(sx - brainW / 2, pillY + 30.5, brainW, 10.5, 3);
+    ctx.fill();
+    ctx.fillStyle = isFallback ? '#ffe4e6' : '#bae6fd';
+    ctx.fillText(brainTag, sx, pillY + 35.8);
+  }
+
   ctx.restore();
 }
 

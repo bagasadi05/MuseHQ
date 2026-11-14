@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
-import { Send, Sparkles, Terminal } from 'lucide-react';
+import { Info, Send, Sparkles, Terminal } from 'lucide-react';
 import { Agent } from '../types';
+import { getAgentBrainBadge } from '../utils/brainBadge';
 
 interface CommandBarProps {
   agents: Agent[];
@@ -39,6 +40,10 @@ export const CommandBar: React.FC<CommandBarProps> = ({
     agents.find((a) => a.id === targetId) ||
     agents.find((a) => a.canDelegate) ||
     agents[0];
+  const targetBrain = selectedTarget ? getAgentBrainBadge(selectedTarget) : null;
+  const targetUnavailable =
+    Boolean(selectedTarget) &&
+    (selectedTarget!.status === 'offline' || targetBrain?.isFallback);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -87,6 +92,7 @@ export const CommandBar: React.FC<CommandBarProps> = ({
             onChange={(e) => setTargetId(e.target.value)}
             disabled={agents.length === 0}
             aria-label="Target bot penerima perintah"
+            title="Perintah dikirim sebagai SATU tugas ke bot yang dipilih; bot eksternal membagi sub-tugas sendiri lewat bot:delegate"
             className="bg-transparent text-xs font-medium text-slate-200 outline-none disabled:opacity-50 cursor-pointer"
           >
             {agents.length === 0 ? (
@@ -96,7 +102,12 @@ export const CommandBar: React.FC<CommandBarProps> = ({
             ) : (
               agents.map((a) => (
                 <option key={a.id} value={a.id} className="bg-slate-900 text-slate-100">
-                  @{a.name} {a.canDelegate ? '(Auto-Bagi Tugas)' : '(Langsung)'}
+                  @{a.name}{' '}
+                  {a.type === 'builtin' && a.canDelegate
+                    ? '(Koordinator Built-in)'
+                    : a.canDelegate
+                      ? '(Bot membagi via bot:delegate)'
+                      : '(Langsung)'}
                 </option>
               ))
             )}
@@ -124,6 +135,25 @@ export const CommandBar: React.FC<CommandBarProps> = ({
           <span>{submitting ? 'Mengirim...' : isRunningMission ? 'Tambah Misi' : 'Kirim Perintah'}</span>
         </button>
       </form>
+
+      <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2 px-1 text-[11px] text-slate-400">
+        <span
+          className="inline-flex items-center gap-1 rounded bg-slate-900/80 px-2 py-0.5 backdrop-blur-sm"
+          title="Server membuat SATU tugas langsung ke bot pilihan Anda; untuk bot eksternal, bot itulah yang membagi tugas lewat event bot:delegate."
+        >
+          <Info className="h-3 w-3 shrink-0 text-sky-400" />
+          <span>
+            Perintah dari kolom ini dikirim sebagai <strong>SATU tugas</strong> ke bot yang dipilih;
+            bot itulah yang membagi tugas ke bot lain — server tidak membagi otomatis untuk bot
+            eksternal.
+          </span>
+        </span>
+        {targetUnavailable && selectedTarget && (
+          <span className="rounded border border-rose-500/40 bg-rose-950/70 px-2 py-0.5 text-[10px] font-semibold text-rose-200">
+            @{selectedTarget.name}: {selectedTarget.status === 'offline' ? 'Offline' : targetBrain?.label} — misi akan ditolak
+          </span>
+        )}
+      </div>
     </div>
   );
 };

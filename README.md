@@ -94,18 +94,21 @@ Keempat ID agen berikut diperlakukan sebagai **rekan setara** di ruangan (tanpa 
 - `muse-niro` (`Muse Niro` — `creative-studio`)
 - `muse-joni` (`Muse Joni` — `engineering-bay`)
 
-Gunakan launcher siap pakai [examples/team-bridge.mjs](examples/team-bridge.mjs) (mendukung auto-reconnect WebSocket, Cloud LLM API di `.env.bridge`/`.env`, serta penerusan ke endpoint bot terpisah via `*_UPSTREAM_URL`):
+Gunakan launcher siap pakai [examples/team-bridge.mjs](examples/team-bridge.mjs) (mendukung auto-reconnect WebSocket dengan backoff auth 401/4001 mulai 5 detik hingga 1 menit, Cloud LLM API di `.env.bridge`/`.env`, serta penerusan ke endpoint bot terpisah via `*_UPSTREAM_URL`):
 ```bash
-# 1. Salin template lalu isi BOT_BRIDGE_TOKEN (+ API key / UPSTREAM_URL bila ada):
+# 1. Salin template lalu isi token per-bot (BOT_BRIDGE_TOKEN_MUSE_BAGAS, dll.)
+#    atau BOT_BRIDGE_TOKENS (+ API key / UPSTREAM_URL bila ada):
 cp .env.bridge.example .env.bridge
 
 # 2. Jalankan ke-4 bot sekaligus ke Render/VPS/lokal:
 npm run bridge:team
 ```
-Atau jalankan masing-masing bot dari mesin/terminal berbeda lewat [examples/muse-peer-bridge.mjs](examples/muse-peer-bridge.mjs):
+Atau jalankan masing-masing bot dari mesin/terminal berbeda lewat [examples/muse-peer-bridge.mjs](examples/muse-peer-bridge.mjs), atau pakai template kotak surat [examples/muse-peer-client.mjs](examples/muse-peer-client.mjs) (`brainMode: "muse-langsung"`):
 ```bash
-BOT_BRIDGE_TOKEN="<TOKEN>" MUSE_WS_URL="wss://musehq.onrender.com/ws/bot" npm run bridge:bot -- --bot=muse-arif
+BOT_BRIDGE_TOKEN_MUSE_ARIF="<TOKEN-ARIF>" MUSE_WS_URL="wss://musehq.onrender.com/ws/bot" npm run bridge:bot -- --bot=muse-arif
 ```
+
+> **Catatan Jujur Otak Bot (`brainMode`):** Bot `external-ws` / `external-rest` tanpa API key / upstream akan mengirim `brainMode: "fallback"`, ditandai merah `"Tanpa otak — tidak bisa kerja"` di UI, serta menolak tugas dengan `task:fail` alih-alih membuat laporan palsu.
 
 ---
 
@@ -114,7 +117,9 @@ BOT_BRIDGE_TOKEN="<TOKEN>" MUSE_WS_URL="wss://musehq.onrender.com/ws/bot" npm ru
 | Variabel | Default | Fungsi |
 |---|---|---|
 | `PORT` | `3001` | Port server Express + WebSocket lokal |
-| `BOT_BRIDGE_TOKEN` | *(auto-random di lokal)* | Token rahasia untuk `/ws/bot` dan `/api/bridge/*` + `GET /api/state` bot |
+| `BOT_BRIDGE_TOKENS` | — | Map JSON / `id=token` token per-bot agar satu bot tidak bisa menyamar menjadi bot lain (bisa juga lewat `BOT_BRIDGE_TOKEN_<BOT_ID>`, mis. `BOT_BRIDGE_TOKEN_MUSE_ARIF`) |
+| `BOT_BRIDGE_TOKEN` | *(auto-random di lokal)* | *(Deprecated selama masa transisi)* Token bersama lama; penggunaannya dicatat sebagai warning deprecated di log server tanpa mencetak nilai token |
+| `MUSE_DATA_DIR` | `/data` (jika tersedia) atau `server/data` | Direktori penyimpanan persisten `state.json`, `settings.json`, serta folder `backups/` (snapshot berkala tiap jam, 24 snapshot terakhir disimpan) |
 | `MUSE_OWNER_PASSCODE` | *(auto-random di lokal)* | Passcode pemilik untuk membuka UI web (`/api/auth/login`) |
 | `SESSION_SECRET` | *(auto-random / derivatif)* | Kunci penandatanganan cookie HMAC `muse_session` |
 | `ALLOWED_ORIGINS` | `http://localhost:5173,http://localhost:3001` | Daftar origin CORS yang diizinkan (pisahkan koma, sertakan skema `http://` atau `https://`) |
@@ -131,9 +136,10 @@ BOT_BRIDGE_TOKEN="<TOKEN>" MUSE_WS_URL="wss://musehq.onrender.com/ws/bot" npm ru
 ## Model Keamanan
 
 - **Tanpa Token Publik Bawaan**: Nilai pengembangan lama sudah dipensiunkan dan ditolak aktif oleh server (`isRetiredToken`). Token acak dibuat otomatis pada run lokal pertama jika belum dikonfigurasi.
-- **Autentikasi Owner (`muse_session`)**: `GET /api/state`, seluruh mutasi misi/agen/pengaturan, dan upgrade `/ws/ui` dilindungi cookie sesi `HttpOnly` bertanda tangan HMAC (`POST /api/auth/login`). `GET /api/state` juga mendukung header `x-muse-token` khusus untuk bot polling REST.
-- **Proteksi Bridge & Validasi Ketat**: `/ws/bot` dan `/api/bridge/*` memeriksa token secara *constant-time*. Event tak dikenal ditolak dengan `400 Bad Request` (REST) atau pesan `error` (WebSocket) tanpa menjatuhkan server.
-- **Privasi Kredensial**: `bridgeToken` dan API key tidak pernah dikembalikan mentah dalam snapshot UI (`PublicSettings` hanya mengirim `bridgeTokenPreview`), tidak dicetak di log endpoint REST, dan tidak pernah ditulis ke kode contoh.
+- **Isolasi Token Per-Bot (`BOT_BRIDGE_TOKENS`)**: Setiap bot memakai token uniknya sendiri sehingga token milik bot A ditolak (`403` / close `4003`) jika mencoba mengirim `bot:hello` sebagai bot B. Token bersama lama tetap diterima sementara dengan log deprecation tanpa membocorkan token.
+- **Autentikasi Owner (`muse_session`)**: `GET /api/state`, seluruh mutasi misi/agen/tugas/pengaturan, dan upgrade `/ws/ui` dilindungi cookie sesi `HttpOnly` bertanda tangan HMAC (`POST /api/auth/login`). `GET /api/state` juga mendukung header `x-muse-token` khusus untuk bot polling REST.
+- **Delegasi Aman & Pengawasan Tugas**: Server menolak delegasi ke diri sendiri, siklus rantai `parentTaskId`, kedalaman delegasi `> 2`, serta misi ke bot offline/fallback; tugas eksternal tanpa progres `> 10` menit otomatis ditandai `stuck`.
+- **Privasi Kredensial**: `bridgeToken`, `botTokens`, passcode, dan API key tidak pernah dikembalikan mentah dalam snapshot UI, tidak dicetak di log server/bridge, dan tidak pernah ditulis ke kode contoh.
 - **CORS Terbatas**: Permintaan lintas-origin hanya diizinkan jika origin cocok dengan `ALLOWED_ORIGINS` atau domain deployment resmi.
 
 ---

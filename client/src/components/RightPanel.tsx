@@ -1,6 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   Activity,
+  AlertTriangle,
+  Ban,
   Bot,
   Check,
   CheckCircle2,
@@ -9,8 +11,10 @@ import {
   Clock,
   Copy,
   FileText,
+  GitBranch,
   ListChecks,
   MessageSquare,
+  RefreshCw,
   RotateCcw,
   Send,
   Settings2,
@@ -26,6 +30,7 @@ import {
   ZONES_META,
   ZoneId,
 } from '../types';
+import { getAgentBrainBadge } from '../utils/brainBadge';
 import { MarkdownView } from './MarkdownView';
 
 interface RightPanelProps {
@@ -45,6 +50,9 @@ interface RightPanelProps {
     createTask: boolean,
     title?: string
   ) => Promise<void>;
+  onCancelTask: (taskId: string) => Promise<void>;
+  onMarkTaskFailed: (taskId: string, reason?: string) => Promise<void>;
+  onReassignTask: (taskId: string, targetAgentId?: string) => Promise<void>;
   onOpenReport: (mission: Mission) => void;
   onClearHistory: () => Promise<void>;
   onResetWorkspace: () => Promise<void>;
@@ -62,9 +70,23 @@ const STATUS_BADGES: Record<string, { label: string; cls: string }> = {
   delegated: { label: 'Menunggu Bot Luar', cls: 'bg-purple-500/20 text-purple-300' },
   working: { label: 'Dikerjakan', cls: 'bg-amber-500/20 text-amber-300' },
   'in-progress': { label: 'Dikerjakan', cls: 'bg-amber-500/20 text-amber-300' },
+  stuck: {
+    label: 'Macet (Stuck)',
+    cls: 'bg-orange-500/20 text-orange-300 border border-orange-500/40',
+  },
   completed: { label: 'Selesai', cls: 'bg-emerald-500/20 text-emerald-300' },
   failed: { label: 'Gagal', cls: 'bg-rose-500/20 text-rose-300' },
 };
+
+const CANCELLABLE_STATUSES = new Set([
+  'queued',
+  'waiting-dependency',
+  'assigned',
+  'delegated',
+  'working',
+  'in-progress',
+  'stuck',
+]);
 
 export const RightPanel: React.FC<RightPanelProps> = ({
   agents,
@@ -77,12 +99,17 @@ export const RightPanel: React.FC<RightPanelProps> = ({
   onDeleteAgent,
   onMoveAgent,
   onSendBotCommand,
+  onCancelTask,
+  onMarkTaskFailed,
+  onReassignTask,
   onOpenReport,
   onClearHistory,
   onResetWorkspace,
 }) => {
   const [tab, setTab] = useState<TabId>('comms');
   const [expandedTaskId, setExpandedTaskId] = useState<string | null>(null);
+  const [reassignTargets, setReassignTargets] = useState<Record<string, string>>({});
+  const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
   const [copiedDeliverableId, setCopiedDeliverableId] = useState<string | null>(null);
 
@@ -219,8 +246,9 @@ export const RightPanel: React.FC<RightPanelProps> = ({
             <span>{confirmReset ? 'Klik lagi: Reset' : 'Reset Ruangan'}</span>
           </button>
         </div>
-        <div className="flex flex-wrap gap-1">
+        <div className="flex flex-wrap gap-1.5">
           {agents.map((a) => {
+            const brain = getAgentBrainBadge(a);
             const dotCls =
               a.status === 'working'
                 ? 'bg-emerald-400 animate-pulse'
@@ -238,16 +266,21 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                 key={a.id}
                 type="button"
                 onClick={() => onSelectAgent(a.id)}
-                title={`${a.name} — ${a.role} (${a.status})`}
-                className={`flex items-center gap-1.5 rounded-md border px-2 py-0.5 text-[11px] transition cursor-pointer ${
+                title={`${a.name} — ${a.role} (${a.status}) | Otak: ${brain.label}`}
+                className={`flex flex-wrap items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] transition cursor-pointer ${
                   selectedAgentId === a.id
                     ? 'border-amber-400/70 bg-amber-500/15 text-amber-100'
-                    : 'border-slate-800 bg-slate-900/90 text-slate-300 hover:border-slate-700'
+                    : brain.isFallback
+                      ? 'border-rose-500/45 bg-rose-950/35 text-rose-100 hover:border-rose-400'
+                      : 'border-slate-800 bg-slate-900/90 text-slate-300 hover:border-slate-700'
                 }`}
               >
                 <span className={`h-1.5 w-1.5 rounded-full ${dotCls}`} />
                 <span className="font-medium">{a.name}</span>
                 <span className="font-mono text-[9px] text-slate-500">{a.status}</span>
+                <span className={`rounded border px-1.5 py-0.5 text-[9px] font-semibold ${brain.cls}`}>
+                  {brain.label}
+                </span>
               </button>
             );
           })}
@@ -443,11 +476,25 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                 const pendingDeps = depTasks.filter(
                   (t) => t.status !== 'completed' && t.status !== 'failed'
                 ).length;
+                const isCancellable = CANCELLABLE_STATUSES.has(task.status);
+                const isStuck = task.status === 'stuck';
+                const capableReassignAgents = agents.filter(
+                  (a) => a.status !== 'offline' && a.brainMode !== 'fallback'
+                );
+                const chosenReassignId =
+                  reassignTargets[task.id] ||
+                  capableReassignAgents.find((a) => a.id !== task.assignedToId)?.id ||
+                  capableReassignAgents[0]?.id ||
+                  '';
 
                 return (
                   <div
                     key={task.id}
-                    className="rounded-xl border border-slate-800 bg-slate-950/70 transition hover:border-slate-700"
+                    className={`rounded-xl border transition ${
+                      isStuck
+                        ? 'border-orange-500/50 bg-orange-950/15'
+                        : 'border-slate-800 bg-slate-950/70 hover:border-slate-700'
+                    }`}
                   >
                     <button
                       type="button"
@@ -495,6 +542,90 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                         {st.label}
                       </span>
                     </button>
+
+                    {(isStuck || isCancellable) && (
+                      <div className="flex flex-wrap items-center gap-1.5 border-t border-slate-800/70 px-2.5 py-2">
+                        {isStuck && (
+                          <>
+                            <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-orange-300">
+                              <AlertTriangle className="h-3 w-3 shrink-0" />
+                              <span>Tanpa kabar &gt; 10 menit:</span>
+                            </span>
+                            {capableReassignAgents.length > 0 && (
+                              <div className="flex items-center gap-1">
+                                <select
+                                  value={chosenReassignId}
+                                  onChange={(e) =>
+                                    setReassignTargets((prev) => ({
+                                      ...prev,
+                                      [task.id]: e.target.value,
+                                    }))
+                                  }
+                                  aria-label="Pilih bot untuk tugaskan ulang"
+                                  className="rounded border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[10px] text-slate-200 outline-none"
+                                >
+                                  {capableReassignAgents.map((a) => (
+                                    <option key={a.id} value={a.id}>
+                                      {a.name}
+                                    </option>
+                                  ))}
+                                </select>
+                                <button
+                                  type="button"
+                                  disabled={busyTaskId === task.id || !chosenReassignId}
+                                  onClick={async () => {
+                                    setBusyTaskId(task.id);
+                                    try {
+                                      await onReassignTask(task.id, chosenReassignId);
+                                    } finally {
+                                      setBusyTaskId(null);
+                                    }
+                                  }}
+                                  className="inline-flex items-center gap-1 rounded border border-sky-500/45 bg-sky-500/15 px-2 py-0.5 text-[10px] font-semibold text-sky-200 transition hover:bg-sky-500/25 disabled:opacity-45 cursor-pointer"
+                                >
+                                  <RefreshCw className="h-2.5 w-2.5" />
+                                  <span>Tugaskan Ulang</span>
+                                </button>
+                              </div>
+                            )}
+                            <button
+                              type="button"
+                              disabled={busyTaskId === task.id}
+                              onClick={async () => {
+                                setBusyTaskId(task.id);
+                                try {
+                                  await onMarkTaskFailed(task.id);
+                                } finally {
+                                  setBusyTaskId(null);
+                                }
+                              }}
+                              className="inline-flex items-center gap-1 rounded border border-rose-500/45 bg-rose-500/15 px-2 py-0.5 text-[10px] font-semibold text-rose-200 transition hover:bg-rose-500/25 disabled:opacity-45 cursor-pointer"
+                            >
+                              <XCircle className="h-2.5 w-2.5" />
+                              <span>Tandai Gagal</span>
+                            </button>
+                          </>
+                        )}
+                        {isCancellable && (
+                          <button
+                            type="button"
+                            disabled={busyTaskId === task.id}
+                            onClick={async () => {
+                              setBusyTaskId(task.id);
+                              try {
+                                await onCancelTask(task.id);
+                              } finally {
+                                setBusyTaskId(null);
+                              }
+                            }}
+                            className="ml-auto inline-flex items-center gap-1 rounded border border-rose-500/40 bg-rose-950/50 px-2 py-0.5 text-[10px] font-semibold text-rose-200 transition hover:bg-rose-500/25 disabled:opacity-45 cursor-pointer"
+                          >
+                            <Ban className="h-2.5 w-2.5" />
+                            <span>Batalkan tugas</span>
+                          </button>
+                        )}
+                      </div>
+                    )}
 
                     {open && (
                       <div className="border-t border-slate-800/80 px-3 py-2.5 text-xs">
@@ -569,8 +700,91 @@ export const RightPanel: React.FC<RightPanelProps> = ({
         {tab === 'deliverables' && (
           <div className="flex flex-col gap-3">
             <div className="text-[11px] font-medium text-slate-400">
-              Deliverables Markdown ({deliverablesCount})
+              Rantai Alur & Deliverables Markdown ({deliverablesCount})
             </div>
+
+            {missions.length > 0 && (
+              <div className="flex flex-col gap-2">
+                {[...missions]
+                  .reverse()
+                  .filter((m) => tasks.some((t) => t.missionId === m.id))
+                  .map((m) => {
+                    const missionTasks = tasks.filter((t) => t.missionId === m.id);
+                    const idSet = new Set(missionTasks.map((t) => t.id));
+                    const childrenMap = new Map<string, Task[]>();
+                    const roots: Task[] = [];
+                    for (const t of missionTasks) {
+                      if (t.parentTaskId && idSet.has(t.parentTaskId)) {
+                        const list = childrenMap.get(t.parentTaskId) || [];
+                        list.push(t);
+                        childrenMap.set(t.parentTaskId, list);
+                      } else {
+                        roots.push(t);
+                      }
+                    }
+
+                    const renderNode = (node: Task, depth: number): React.ReactNode => {
+                      const worker = agents.find((a) => a.id === node.assignedToId);
+                      const fromBot = agents.find((a) => a.id === node.assignedById);
+                      const badge = STATUS_BADGES[node.status] || STATUS_BADGES.queued;
+                      const children = childrenMap.get(node.id) || [];
+                      return (
+                        <div key={node.id} className={depth > 0 ? 'ml-3 border-l border-slate-700/80 pl-2.5 mt-1.5' : 'mt-1.5'}>
+                          <div className="flex items-start justify-between gap-2 rounded-lg border border-slate-800/80 bg-slate-900/70 px-2 py-1.5 text-[11px]">
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-1.5 font-medium text-slate-200">
+                                <span className="text-[10px] uppercase tracking-wide text-slate-400">
+                                  {depth === 0 ? 'Tugas' : 'Sub-delegasi'}
+                                </span>
+                                <span className="truncate">{node.title}</span>
+                              </div>
+                              <div className="mt-0.5 text-[10px] text-slate-400">
+                                {fromBot ? fromBot.name : node.assignedById === 'user' ? 'Owner' : node.assignedById} →{' '}
+                                <span style={{ color: worker?.color || '#38bdf8' }}>
+                                  {worker?.name || node.assignedToId}
+                                </span>
+                              </div>
+                            </div>
+                            <span className={`shrink-0 rounded px-1.5 py-0.5 text-[9px] font-semibold ${badge.cls}`}>
+                              {badge.label}
+                            </span>
+                          </div>
+                          {children.map((child) => renderNode(child, depth + 1))}
+                        </div>
+                      );
+                    };
+
+                    return (
+                      <div
+                        key={`chain-${m.id}`}
+                        className="rounded-xl border border-slate-800 bg-slate-950/75 p-2.5"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-sky-300">
+                            <GitBranch className="h-3 w-3 shrink-0" />
+                            <span>Misi → Tugas → Sub-delegasi</span>
+                          </div>
+                          <span
+                            className={`rounded px-1.5 py-0.5 text-[9px] font-semibold ${
+                              m.status === 'completed'
+                                ? 'bg-emerald-500/20 text-emerald-300'
+                                : m.status === 'failed'
+                                  ? 'bg-rose-500/20 text-rose-300'
+                                  : 'bg-amber-500/20 text-amber-300'
+                            }`}
+                          >
+                            {m.status === 'completed' ? 'Selesai' : m.status === 'failed' ? 'Gagal' : 'Berjalan'}
+                          </span>
+                        </div>
+                        <div className="mt-1 line-clamp-2 text-[11px] font-semibold text-slate-100">
+                          {m.prompt}
+                        </div>
+                        <div className="mt-1">{roots.map((r) => renderNode(r, 0))}</div>
+                      </div>
+                    );
+                  })}
+              </div>
+            )}
 
             {deliverablesCount === 0 ? (
               <div className="rounded-xl border border-dashed border-slate-800 p-6 text-center text-xs text-slate-400">
@@ -833,25 +1047,38 @@ const BotInspector: React.FC<BotInspectorProps> = ({
       </div>
 
       {/* Status Header */}
-      <div className="flex items-center justify-between rounded-xl border border-slate-800 bg-slate-950/70 p-2.5">
-        <div className="flex items-center gap-2">
-          <div
-            className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-950"
-            style={{ backgroundColor: selectedAgent.color }}
-          >
-            <Bot className="h-4 w-4" />
-          </div>
-          <div>
-            <div className="text-xs font-bold text-slate-100">{selectedAgent.name}</div>
-            <div className="font-mono text-[10px] text-slate-400">
-              ID: {selectedAgent.id} • {selectedAgent.type}
+      {(() => {
+        const selectedBrain = getAgentBrainBadge(selectedAgent);
+        return (
+          <div className="flex flex-col gap-2 rounded-xl border border-slate-800 bg-slate-950/70 p-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <div
+                  className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-950"
+                  style={{ backgroundColor: selectedAgent.color }}
+                >
+                  <Bot className="h-4 w-4" />
+                </div>
+                <div>
+                  <div className="text-xs font-bold text-slate-100">{selectedAgent.name}</div>
+                  <div className="font-mono text-[10px] text-slate-400">
+                    ID: {selectedAgent.id} • {selectedAgent.type}
+                  </div>
+                </div>
+              </div>
+              <span className="rounded-md bg-slate-800 px-2 py-0.5 font-mono text-[10px] uppercase text-sky-300">
+                {selectedAgent.status}
+              </span>
+            </div>
+            <div className="flex items-center justify-between border-t border-slate-800/70 pt-1.5 text-[10px]">
+              <span className="text-slate-400">Otak / Eksekutor:</span>
+              <span className={`rounded border px-2 py-0.5 font-semibold ${selectedBrain.cls}`}>
+                {selectedBrain.label}
+              </span>
             </div>
           </div>
-        </div>
-        <span className="rounded-md bg-slate-800 px-2 py-0.5 font-mono text-[10px] uppercase text-sky-300">
-          {selectedAgent.status}
-        </span>
-      </div>
+        );
+      })()}
 
       {/* Quick Move Room Buttons */}
       <div>

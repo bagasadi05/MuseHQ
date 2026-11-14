@@ -1,9 +1,13 @@
 import { IncomingMessage } from 'node:http';
 import { WebSocket, WebSocketServer } from 'ws';
 import { normalizeZoneId, pickSpotInZone } from '../officeMap.js';
-import { extractBearerOrHeaderToken, isRetiredToken, timingSafeEqualStr } from '../security.js';
+import {
+  authenticateBridgeToken,
+  extractBearerOrHeaderToken,
+  logDeprecatedLegacyTokenOnce,
+} from '../security.js';
 import { WorkspaceStore } from '../store.js';
-import { Agent, AgentStatus, CommsMessage, Task, ZoneId } from '../types.js';
+import { Agent, AgentStatus, BrainMode, CommsMessage, Task, ZoneId } from '../types.js';
 
 export class BridgeValidationError extends Error {
   constructor(
@@ -66,6 +70,31 @@ const VALID_STATUSES: AgentStatus[] = [
   'offline',
   'error',
 ];
+
+const VALID_BRAIN_MODES: readonly BrainMode[] = [
+  'muse-langsung',
+  'gemini',
+  'openai',
+  'anthropic',
+  'upstream',
+  'fallback',
+];
+
+export function normalizeBrainMode(raw: unknown): BrainMode | undefined {
+  if (raw === undefined || raw === null || raw === '') return undefined;
+  if (typeof raw !== 'string') {
+    throw new BridgeValidationError(
+      'Field "brainMode" harus berupa string (muse-langsung | gemini | openai | anthropic | upstream | fallback)'
+    );
+  }
+  const normalized = raw.trim().toLowerCase() as BrainMode;
+  if (!VALID_BRAIN_MODES.includes(normalized)) {
+    throw new BridgeValidationError(
+      `brainMode tidak valid: "${raw}". Pilih salah satu: ${VALID_BRAIN_MODES.join(', ')}`
+    );
+  }
+  return normalized;
+}
 
 export function normalizeAgentStatus(raw: unknown): AgentStatus | null {
   if (typeof raw !== 'string') return null;
@@ -183,6 +212,19 @@ export class ExternalBridge {
     });
   }
 
+  notifyBotTaskFailed(agentId: string, payload: Record<string, unknown>): void {
+    const outboxItem = this.store.pushBotOutboxEvent(agentId, 'task:fail', payload);
+    const sock = this.botSockets.get(agentId);
+    if (sock && sock.readyState === WebSocket.OPEN) {
+      sock.send(
+        JSON.stringify({
+          event: 'task:fail',
+          payload: { ...outboxItem.payload, seq: outboxItem.seq },
+        })
+      );
+    }
+  }
+
   private handleBotConnection(ws: WebSocket, req: IncomingMessage): void {
     let url: URL;
     try {
@@ -193,15 +235,32 @@ export class ExternalBridge {
     }
 
     const token = (url.searchParams.get('token') || extractBearerOrHeaderToken(req)).trim();
-    const expectedToken = this.store.getSettings().bridgeToken;
+    const rawQueryAgentId = url.searchParams.get('agentId')?.trim() || undefined;
+    const settings = this.store.getSettings();
+    const auth = authenticateBridgeToken(
+      token,
+      settings.botTokens,
+      settings.bridgeToken,
+      rawQueryAgentId
+    );
 
-    if (!token || isRetiredToken(token) || !timingSafeEqualStr(token, expectedToken)) {
-      ws.send(JSON.stringify({ event: 'error', payload: { message: 'Unauthorized bridge token' } }));
-      ws.close(4001, 'Unauthorized');
+    if (!auth.ok) {
+      if (auth.forbiddenImpersonation) {
+        ws.send(JSON.stringify({ event: 'error', payload: { message: auth.reason } }));
+        ws.close(4003, 'Forbidden: cannot impersonate another bot');
+      } else {
+        ws.send(JSON.stringify({ event: 'error', payload: { message: 'Unauthorized bridge token' } }));
+        ws.close(4001, 'Unauthorized');
+      }
       return;
     }
 
-    let boundAgentId: string | null = url.searchParams.get('agentId');
+    if (auth.deprecatedLegacy) {
+      logDeprecatedLegacyTokenOnce(`ws:${rawQueryAgentId || 'unknown'}`);
+    }
+
+    const authenticatedBotId = auth.matchedBotId;
+    let boundAgentId: string | null = rawQueryAgentId || null;
     if (boundAgentId) {
       if (!VALID_BOT_ID_RE.test(boundAgentId)) {
         ws.send(JSON.stringify({ event: 'error', payload: { message: 'Invalid agentId' } }));
@@ -296,7 +355,13 @@ export class ExternalBridge {
           const requestedId =
             typeof payload.id === 'string' && payload.id.trim()
               ? payload.id.trim()
-              : boundAgentId || undefined;
+              : authenticatedBotId || boundAgentId || undefined;
+          if (authenticatedBotId && requestedId && requestedId !== authenticatedBotId) {
+            const denyMsg = `Ditolak: token bot "${authenticatedBotId}" tidak boleh menyamar sebagai "${requestedId}".`;
+            ws.send(JSON.stringify({ event: 'error', payload: { message: denyMsg } }));
+            ws.close(4003, 'Forbidden: cannot impersonate another bot');
+            return;
+          }
           if (requestedId && clientEventId && this.store.hasBridgeEventId(requestedId, clientEventId)) {
             const existing = this.store.getAgent(requestedId);
             if (existing) {
@@ -308,6 +373,7 @@ export class ExternalBridge {
               return;
             }
           }
+          const brainMode = normalizeBrainMode(payload.brainMode);
           const agent = this.registerOrUpdateExternalBot({
             id: requestedId,
             name: typeof payload.name === 'string' ? payload.name : 'External Muse Bot',
@@ -319,6 +385,7 @@ export class ExternalBridge {
             homeZone: payload.homeZone,
             color: typeof payload.color === 'string' ? payload.color : undefined,
             canDelegate: Boolean(payload.canDelegate),
+            brainMode,
             type: 'external-ws',
           });
           if (clientEventId) {
@@ -410,6 +477,7 @@ export class ExternalBridge {
     homeZone?: unknown;
     color?: string;
     canDelegate?: boolean;
+    brainMode?: BrainMode;
     type: 'external-ws' | 'external-rest' | 'external-webhook';
     webhookUrl?: string;
   }): Agent {
@@ -470,6 +538,7 @@ export class ExternalBridge {
           : {}),
         color: input.color?.trim() || existing.color,
         canDelegate: input.canDelegate ?? existing.canDelegate,
+        ...(input.brainMode ? { brainMode: input.brainMode } : {}),
         type: input.type,
         webhookUrl: validatedWebhook ?? existing.webhookUrl,
         bridgeConnected: true,
@@ -489,6 +558,7 @@ export class ExternalBridge {
       type: input.type,
       provider: this.store.getSettings().defaultProvider,
       model: 'external',
+      ...(input.brainMode ? { brainMode: input.brainMode } : {}),
       webhookUrl: validatedWebhook,
       bridgeConnected: true,
       canDelegate: Boolean(input.canDelegate),
@@ -516,7 +586,14 @@ export class ExternalBridge {
     agentId: string,
     event: string,
     payload: Record<string, unknown> = {}
-  ): Promise<{ ok: true; duplicate?: boolean; agent?: Agent }> {
+  ): Promise<{
+    ok: true;
+    duplicate?: boolean;
+    agent?: Agent;
+    failed?: boolean;
+    taskId?: string;
+    error?: string;
+  }> {
     if (!ALLOWED_BRIDGE_EVENTS.has(event)) {
       throw new BridgeValidationError(`Event bridge tidak dikenal: ${event}`);
     }
@@ -547,6 +624,7 @@ export class ExternalBridge {
             : 'external-rest';
 
       const existing = Boolean(this.store.getAgent(agentId));
+      const brainMode = normalizeBrainMode(payload.brainMode);
       const registered = this.registerOrUpdateExternalBot({
         id: agentId,
         name: typeof payload.name === 'string' ? payload.name : agentId,
@@ -556,6 +634,7 @@ export class ExternalBridge {
         homeZone: payload.homeZone,
         color: typeof payload.color === 'string' ? payload.color : undefined,
         canDelegate: payload.canDelegate !== undefined ? Boolean(payload.canDelegate) : undefined,
+        brainMode,
         type: botType,
         webhookUrl,
       });
@@ -620,6 +699,13 @@ export class ExternalBridge {
       if (clientEventId) this.store.recordBridgeEventId(agentId, clientEventId);
 
       const bridgeConnected = nextStatus === 'offline' ? false : true;
+      const reportedTaskId =
+        typeof payload.taskId === 'string' && payload.taskId.trim()
+          ? payload.taskId.trim()
+          : agent.currentTaskId;
+      if (reportedTaskId && nextStatus && ['working', 'thinking', 'talking'].includes(nextStatus)) {
+        this.store.touchTaskActivity(reportedTaskId);
+      }
       if (nextZone) {
         this.store.updateAgent(agentId, { bridgeConnected });
         this.store.moveAgentToZone(agentId, nextZone, 0, nextStatus);
@@ -762,7 +848,12 @@ export class ExternalBridge {
       if (!created) {
         throw new BridgeValidationError(`Bot target "${toAgentId}" tidak ditemukan`, 404);
       }
-      return { ok: true };
+      return {
+        ok: true,
+        ...(created.status === 'failed'
+          ? { failed: true, taskId: created.id, error: created.error }
+          : { taskId: created.id }),
+      };
     }
 
     if (event === 'task:complete' && this.handlers) {
@@ -860,11 +951,13 @@ export class ExternalBridge {
 
     if (agent.type === 'external-webhook' && agent.webhookUrl) {
       try {
+        const settings = this.store.getSettings();
+        const outboundToken = settings.botTokens?.[agent.id] || settings.bridgeToken;
         const res = await fetch(agent.webhookUrl, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'x-muse-token': this.store.getSettings().bridgeToken,
+            'x-muse-token': outboundToken,
           },
           body: JSON.stringify(packet),
         });

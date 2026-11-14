@@ -18,7 +18,7 @@ const parsedPort = Number(process.env.PORT);
 const PORT = Number.isInteger(parsedPort) && parsedPort > 0 ? parsedPort : 3001;
 const HOST = (process.env.HOST || '0.0.0.0').trim() || '0.0.0.0';
 
-const { app, store, bridge, allowedOrigins } = createMuseApp();
+const { app, store, bridge, orchestrator, allowedOrigins } = createMuseApp();
 
 // Serve built client assets when running in standalone Node production mode
 const clientDist = path.resolve(__dirname, '..', '..', 'client', 'dist');
@@ -76,7 +76,6 @@ server.on('upgrade', (request, socket, head) => {
 
 server.listen(PORT, HOST, () => {
   const sec = store.getSecurityStatus();
-  const settings = store.getSettings();
   const externalUrl = process.env.RENDER_EXTERNAL_URL?.trim().replace(/\/+$/, '');
   console.log(`MuseHQ server running at http://${HOST}:${PORT}`);
   if (externalUrl) {
@@ -95,16 +94,17 @@ server.listen(PORT, HOST, () => {
   }
   if (sec.generatedOwnerPasscode) {
     console.log(
-      `[SECURITY] Owner Passcode (MUSE_OWNER_PASSCODE) lokal dibuat: ${settings.ownerPasscode}`
+      `[SECURITY] Owner Passcode (MUSE_OWNER_PASSCODE) lokal dibuat & disimpan di: ${sec.settingsFilePath}`
     );
     console.log(
-      `[SECURITY] Gunakan passcode di atas untuk membuka UI web pertama kali, atau atur MUSE_OWNER_PASSCODE di server/.env.`
+      `[SECURITY] Baca passcode lokal dari settings.json di folder data, atau atur MUSE_OWNER_PASSCODE di environment variable.`
     );
   }
 });
 
 function handleShutdown() {
-  store.flushPersist();
+  orchestrator.stopMonitors();
+  store.dispose();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 1000).unref();
 }

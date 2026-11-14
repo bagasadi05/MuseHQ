@@ -3,18 +3,21 @@ import {
   BridgeValidationError,
   ExternalBridge,
   normalizeAgentStatus,
+  normalizeBrainMode,
   validateWebhookUrl,
 } from '../bridge/externalBridge.js';
 import { MissionOrchestrator, MissionPreconditionError } from '../llm/orchestrator.js';
 import { MissingProviderKeyError } from '../llm/providers.js';
 import { normalizeZoneId, pickSpotInZone } from '../officeMap.js';
 import {
+  BridgeAuthResult,
   SESSION_COOKIE_NAME,
+  authenticateBridgeToken,
   buildClearSessionCookie,
   buildSessionCookie,
   extractBearerOrHeaderToken,
   isHttpsRequest,
-  isRetiredToken,
+  logDeprecatedLegacyTokenOnce,
   parseCookies,
   signSessionToken,
   timingSafeEqualStr,
@@ -38,12 +41,19 @@ export function createApiRouter(
     return Boolean(verifySessionToken(token, store.getSettings().sessionSecret));
   };
 
-  const isBridgeAuthenticated = (req: Request): boolean => {
-    // Only inspect headers on REST routes so bridge tokens never leak in HTTP access logs
+  const authenticateBridge = (req: Request, claimedBotId?: string): BridgeAuthResult => {
     const supplied = extractBearerOrHeaderToken(req);
-    const expected = store.getSettings().bridgeToken;
-    if (!supplied || !expected || isRetiredToken(supplied)) return false;
-    return timingSafeEqualStr(supplied, expected);
+    const settings = store.getSettings();
+    const auth = authenticateBridgeToken(
+      supplied,
+      settings.botTokens,
+      settings.bridgeToken,
+      claimedBotId
+    );
+    if (auth.ok && auth.deprecatedLegacy) {
+      logDeprecatedLegacyTokenOnce(`rest:${claimedBotId || req.path}`);
+    }
+    return auth;
   };
 
   const requireOwner = (req: Request, res: Response, next: NextFunction): void => {
@@ -54,19 +64,38 @@ export function createApiRouter(
     next();
   };
 
-  const requireBridgeToken = (req: Request, res: Response, next: NextFunction): void => {
-    if (!isBridgeAuthenticated(req)) {
-      res.status(401).json({ error: 'Invalid or missing x-muse-token' });
-      return;
+  const handleBridgeAuth = (req: Request, res: Response, claimedBotId?: string): BridgeAuthResult | null => {
+    const auth = authenticateBridge(req, claimedBotId);
+    if (!auth.ok) {
+      if (auth.forbiddenImpersonation) {
+        res.status(403).json({ error: auth.reason || 'Token tidak berhak mengakses bot lain' });
+      } else {
+        res.status(401).json({ error: 'Invalid or missing x-muse-token' });
+      }
+      return null;
     }
+    return auth;
+  };
+
+  const requireBridgeToken = (req: Request, res: Response, next: NextFunction): void => {
+    const claimedBotId = req.params.id && req.path.startsWith('/bridge/bots/') ? req.params.id : undefined;
+    const auth = handleBridgeAuth(req, res, claimedBotId);
+    if (!auth) return;
+    res.locals.bridgeAuth = auth;
     next();
   };
 
   const requireOwnerOrBridge = (req: Request, res: Response, next: NextFunction): void => {
-    if (!isOwnerAuthenticated(req) && !isBridgeAuthenticated(req)) {
+    if (isOwnerAuthenticated(req)) {
+      next();
+      return;
+    }
+    const auth = authenticateBridge(req);
+    if (!auth.ok) {
       res.status(401).json({ error: 'Unauthorized: login owner atau sertakan header x-muse-token.' });
       return;
     }
+    res.locals.bridgeAuth = auth;
     next();
   };
 
@@ -214,6 +243,38 @@ export function createApiRouter(
   router.post('/workspace/reset', noStore, requireOwnerOrBridge, (_req, res) => {
     const snapshot = store.resetWorkspace();
     res.json({ ok: true, snapshot });
+  });
+
+  router.post('/tasks/:id/cancel', noStore, requireOwner, async (req, res) => {
+    const outcome = await orchestrator.cancelTask(req.params.id);
+    if (!outcome.ok) {
+      res.status(outcome.reason === 'Tugas tidak ditemukan' ? 404 : 400).json({ error: outcome.reason });
+      return;
+    }
+    res.json({ ok: true, task: outcome.task, snapshot: store.getSnapshot() });
+  });
+
+  router.post('/tasks/:id/fail', noStore, requireOwner, async (req, res) => {
+    const { reason } = (req.body || {}) as { reason?: unknown };
+    const cleanReason = typeof reason === 'string' && reason.trim() ? reason.trim() : undefined;
+    const outcome = await orchestrator.markTaskFailedByOwner(req.params.id, cleanReason);
+    if (!outcome.ok) {
+      res.status(outcome.reason === 'Tugas tidak ditemukan' ? 404 : 400).json({ error: outcome.reason });
+      return;
+    }
+    res.json({ ok: true, task: outcome.task, snapshot: store.getSnapshot() });
+  });
+
+  router.post('/tasks/:id/reassign', noStore, requireOwner, async (req, res) => {
+    const { targetAgentId } = (req.body || {}) as { targetAgentId?: unknown };
+    const cleanTarget =
+      typeof targetAgentId === 'string' && targetAgentId.trim() ? targetAgentId.trim() : undefined;
+    const outcome = await orchestrator.reassignTask(req.params.id, cleanTarget);
+    if (!outcome.ok) {
+      res.status(outcome.reason === 'Tugas tidak ditemukan' ? 404 : 400).json({ error: outcome.reason });
+      return;
+    }
+    res.json({ ok: true, task: outcome.task, snapshot: store.getSnapshot() });
   });
 
   router.post('/agents', requireOwner, (req, res) => {
@@ -530,6 +591,7 @@ export function createApiRouter(
 
   router.post('/bridge/register', noStore, requireBridgeToken, (req, res) => {
     try {
+      const bridgeAuth = res.locals.bridgeAuth as BridgeAuthResult | undefined;
       const body = (req.body || {}) as {
         id?: unknown;
         name?: unknown;
@@ -538,6 +600,7 @@ export function createApiRouter(
         homeZone?: ZoneId;
         color?: unknown;
         canDelegate?: unknown;
+        brainMode?: unknown;
         webhookUrl?: unknown;
       };
       if (typeof body.name !== 'string' || !body.name.trim()) {
@@ -548,15 +611,25 @@ export function createApiRouter(
         res.status(400).json({ error: 'id harus berupa string' });
         return;
       }
+      const requestedId =
+        typeof body.id === 'string' && body.id.trim() ? body.id.trim() : bridgeAuth?.matchedBotId;
+      if (bridgeAuth?.matchedBotId && requestedId && requestedId !== bridgeAuth.matchedBotId) {
+        res.status(403).json({
+          error: `Token bot ini hanya sah untuk "${bridgeAuth.matchedBotId}" dan tidak boleh menyamar sebagai "${requestedId}"`,
+        });
+        return;
+      }
       const webhookUrl = validateWebhookUrl(body.webhookUrl);
+      const brainMode = normalizeBrainMode(body.brainMode);
       const agent = bridge.registerOrUpdateExternalBot({
-        id: typeof body.id === 'string' ? body.id : undefined,
+        id: requestedId,
         name: body.name.trim(),
         role: typeof body.role === 'string' && body.role.trim() ? body.role.trim() : 'External Bot',
         description: typeof body.description === 'string' ? body.description : undefined,
         homeZone: body.homeZone,
         color: typeof body.color === 'string' ? body.color : undefined,
         canDelegate: body.canDelegate !== undefined ? Boolean(body.canDelegate) : undefined,
+        brainMode,
         type: webhookUrl ? 'external-webhook' : 'external-rest',
         webhookUrl,
       });
@@ -600,7 +673,14 @@ export function createApiRouter(
         payload.eventId = body.eventId.trim();
       }
       const result = await bridge.processBotEvent(req.params.id, body.event.trim(), payload);
-      res.json({ ok: true, duplicate: Boolean(result.duplicate), agent: result.agent, cursor: store.getSnapshot().cursor });
+      res.json({
+        ok: true,
+        duplicate: Boolean(result.duplicate),
+        ...(result.taskId ? { taskId: result.taskId } : {}),
+        ...(result.failed ? { failed: true, error: result.error } : {}),
+        agent: result.agent,
+        cursor: store.getSnapshot().cursor,
+      });
     } catch (err) {
       const status = err instanceof BridgeValidationError ? err.statusCode : 400;
       res.status(status).json({ error: err instanceof Error ? err.message : 'Invalid bridge event' });
@@ -608,6 +688,14 @@ export function createApiRouter(
   });
 
   router.post('/bridge/tasks/:id/complete', noStore, requireBridgeToken, async (req, res) => {
+    const bridgeAuth = res.locals.bridgeAuth as BridgeAuthResult | undefined;
+    const existingTask = store.getTask(req.params.id);
+    if (bridgeAuth?.matchedBotId && existingTask && existingTask.assignedToId !== bridgeAuth.matchedBotId) {
+      res.status(403).json({
+        error: `Token bot ini hanya sah untuk "${bridgeAuth.matchedBotId}" dan tidak boleh menyelesaikan tugas milik "${existingTask.assignedToId}"`,
+      });
+      return;
+    }
     const { result, speech } = (req.body || {}) as { result?: unknown; speech?: unknown };
     if (result !== undefined && typeof result !== 'string') {
       res.status(400).json({ error: 'result harus berupa string' });
@@ -620,7 +708,8 @@ export function createApiRouter(
     const outcome = await orchestrator.completeExternalTask(
       req.params.id,
       (typeof result === 'string' && result.trim()) ? result : 'Selesai dikerjakan oleh bot eksternal.',
-      typeof speech === 'string' ? speech : undefined
+      typeof speech === 'string' ? speech : undefined,
+      bridgeAuth?.matchedBotId
     );
     if (!outcome.applied) {
       res.status(404).json({ error: outcome.reason || 'Tugas tidak ditemukan' });
@@ -630,6 +719,14 @@ export function createApiRouter(
   });
 
   router.post('/bridge/tasks/:id/fail', noStore, requireBridgeToken, async (req, res) => {
+    const bridgeAuth = res.locals.bridgeAuth as BridgeAuthResult | undefined;
+    const existingTask = store.getTask(req.params.id);
+    if (bridgeAuth?.matchedBotId && existingTask && existingTask.assignedToId !== bridgeAuth.matchedBotId) {
+      res.status(403).json({
+        error: `Token bot ini hanya sah untuk "${bridgeAuth.matchedBotId}" dan tidak boleh menggagalkan tugas milik "${existingTask.assignedToId}"`,
+      });
+      return;
+    }
     const { error } = (req.body || {}) as { error?: unknown };
     if (error !== undefined && typeof error !== 'string') {
       res.status(400).json({ error: 'error harus berupa string' });
@@ -637,7 +734,8 @@ export function createApiRouter(
     }
     const outcome = await orchestrator.failExternalTask(
       req.params.id,
-      (typeof error === 'string' && error.trim()) ? error : 'External task failed'
+      (typeof error === 'string' && error.trim()) ? error : 'External task failed',
+      bridgeAuth?.matchedBotId
     );
     if (!outcome.applied) {
       res.status(404).json({ error: outcome.reason || 'Tugas tidak ditemukan' });

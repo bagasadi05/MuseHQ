@@ -167,6 +167,7 @@ export function useMuseSocket() {
   const [comms, setComms] = useState<CommsMessage[]>([]);
   const [beams, setBeams] = useState<CommandBeam[]>([]);
   const [settings, setSettings] = useState<PublicSettings>(DEFAULT_SETTINGS);
+  const [stateResetNotice, setStateResetNotice] = useState<string | null>(null);
 
   const reconnectTimer = useRef<number | null>(null);
   const transportRef = useRef<TransportMode>('ws');
@@ -187,6 +188,7 @@ export function useMuseSocket() {
     setTasks(snap.tasks || []);
     setComms(snap.comms || []);
     setBeams((snap.beams || []).filter((b) => b.expiresAt > Date.now()));
+    setStateResetNotice(snap.stateResetNotice || null);
     if (snap.settings) setSettings(snap.settings);
   }, []);
 
@@ -213,6 +215,7 @@ export function useMuseSocket() {
         }
         case 'mission:updated': {
           const incoming = payload as Mission;
+          setStateResetNotice(null);
           setMissions((prev) => {
             const exists = prev.some((m) => m.id === incoming.id);
             return exists
@@ -394,6 +397,7 @@ export function useMuseSocket() {
         }
 
         setBeams((snap.beams || []).filter((b) => b.expiresAt > Date.now()));
+        setStateResetNotice(snap.stateResetNotice || null);
         if (snap.settings) {
           const safePrefs = loadSafeCloudPreferences();
           setSettings(
@@ -840,11 +844,65 @@ export function useMuseSocket() {
     if (transportRef.current === 'cloud') {
       removeStorage(CLOUD_CACHE_KEY);
     }
-    if (res.snapshot) {
-      applySnapshot(res.snapshot);
-    }
-    return res;
-  }, [applySnapshot]);
+        if (res.snapshot) {
+          applySnapshot(res.snapshot);
+        }
+        return res;
+      },
+      [applySnapshot]
+    );
+
+  const cancelTask = useCallback(
+    async (taskId: string) => {
+      const res = await apiJson<{ ok: boolean; snapshot?: WorkspaceSnapshot }>(
+        `/api/tasks/${encodeURIComponent(taskId)}/cancel`,
+        { method: 'POST' }
+      ).catch(handleAuthGuard);
+      if (transportRef.current === 'cloud' && res.snapshot) {
+        applySnapshot(res.snapshot);
+      }
+      return res;
+    },
+    [applySnapshot]
+  );
+
+  const markTaskFailed = useCallback(
+    async (taskId: string, reason?: string) => {
+      const res = await apiJson<{ ok: boolean; snapshot?: WorkspaceSnapshot }>(
+        `/api/tasks/${encodeURIComponent(taskId)}/fail`,
+        {
+          method: 'POST',
+          body: JSON.stringify(reason ? { reason } : {}),
+        }
+      ).catch(handleAuthGuard);
+      if (transportRef.current === 'cloud' && res.snapshot) {
+        applySnapshot(res.snapshot);
+      }
+      return res;
+    },
+    [applySnapshot]
+  );
+
+  const reassignTask = useCallback(
+    async (taskId: string, targetAgentId?: string) => {
+      const res = await apiJson<{ ok: boolean; snapshot?: WorkspaceSnapshot }>(
+        `/api/tasks/${encodeURIComponent(taskId)}/reassign`,
+        {
+          method: 'POST',
+          body: JSON.stringify(targetAgentId ? { targetAgentId } : {}),
+        }
+      ).catch(handleAuthGuard);
+      if (transportRef.current === 'cloud' && res.snapshot) {
+        applySnapshot(res.snapshot);
+      }
+      return res;
+    },
+    [applySnapshot]
+  );
+
+  const dismissResetNotice = useCallback(() => {
+    setStateResetNotice(null);
+  }, []);
 
   return {
     authStatus,
@@ -858,6 +916,8 @@ export function useMuseSocket() {
     comms,
     beams,
     settings,
+    stateResetNotice,
+    dismissResetNotice,
     login,
     logout,
     launchMission,
@@ -870,5 +930,8 @@ export function useMuseSocket() {
     updateSettings,
     clearHistory,
     resetWorkspace,
+    cancelTask,
+    markTaskFailed,
+    reassignTask,
   };
 }

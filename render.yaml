@@ -11,6 +11,12 @@ services:
         value: "24"
       - key: BOT_BRIDGE_TOKEN
         sync: false
+      - key: BOT_BRIDGE_TOKENS
+        sync: false
+      # Opsional: aktifkan Render Persistent Disk (mount `/data` di paket Starter+)
+      # atau atur MUSE_DATA_DIR=/data agar riwayat misi tidak hilang saat restart.
+      - key: MUSE_DATA_DIR
+        sync: false
       - key: MUSE_OWNER_PASSCODE
         sync: false
       - key: SESSION_SECRET

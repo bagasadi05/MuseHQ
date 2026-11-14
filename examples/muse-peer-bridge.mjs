@@ -8,9 +8,18 @@
 
 import { pathToFileURL } from 'node:url';
 import { createEnvReader, redactWsUrl } from './lib/env-loader.mjs';
-import { resolveBridgeToken } from './lib/resolve-token.mjs';
+import {
+  AUTH_RETRY_MESSAGE,
+  computeAuthBackoffMs,
+  resolveBridgeToken,
+} from './lib/resolve-token.mjs';
 import { resolvePeerPreset } from './lib/peer-presets.mjs';
-import { describeBrainMode, executeForPeer } from './lib/brain-adapter.mjs';
+import {
+  NO_BRAIN_FAILURE_MESSAGE,
+  describeBrainMode,
+  executeForPeer,
+  resolveReportedBrainMode,
+} from './lib/brain-adapter.mjs';
 
 const HEARTBEAT_MS = 20_000;
 const INITIAL_RECONNECT_MS = 1_500;
@@ -105,6 +114,13 @@ export function createPeerBridgeClient({ peer, wsUrl, token, env, announceOnBoot
         fromName: assignedById || 'Owner',
       });
 
+      if (outcome.failed) {
+        const failReason = outcome.error || NO_BRAIN_FAILURE_MESSAGE;
+        send('task:fail', { taskId, error: failReason }, `fail-${peer.id}-${taskId}`);
+        console.error(`[${peer.id}] Tugas GAGAL (${outcome.modeUsed || 'fallback'}): ${failReason}`);
+        return;
+      }
+
       if (peer.canDelegate && outcome.delegations.length > 0) {
         for (let idx = 0; idx < outcome.delegations.length; idx++) {
           const del = outcome.delegations[idx];
@@ -171,6 +187,7 @@ export function createPeerBridgeClient({ peer, wsUrl, token, env, announceOnBoot
       instructions: msg.content,
       fromName: msg.fromName || msg.fromId,
     });
+    if (reply.failed) return;
     const text = String(reply.result || reply.speech || '').slice(0, 280).trim();
     if (!text) return;
 
@@ -184,9 +201,11 @@ export function createPeerBridgeClient({ peer, wsUrl, token, env, announceOnBoot
     );
   };
 
-  const scheduleReconnect = () => {
+  const scheduleReconnect = (isAuthFailure = false) => {
     if (stopped || reconnectTimer) return;
-    const delay = Math.min(MAX_RECONNECT_MS, Math.round(INITIAL_RECONNECT_MS * 1.5 ** reconnectAttempt));
+    const delay = isAuthFailure
+      ? computeAuthBackoffMs(reconnectAttempt)
+      : Math.min(MAX_RECONNECT_MS, Math.round(INITIAL_RECONNECT_MS * 1.5 ** reconnectAttempt));
     reconnectAttempt += 1;
     console.log(`[${peer.id}] Menyambung ulang dalam ${delay}ms...`);
     reconnectTimer = setTimeout(() => {
@@ -197,12 +216,13 @@ export function createPeerBridgeClient({ peer, wsUrl, token, env, announceOnBoot
 
   const connect = () => {
     if (stopped) return;
+    let authRejected = false;
+    const brainMode = resolveReportedBrainMode(peer, env);
     console.log(`[${peer.id}] Menghubungkan (${describeBrainMode(peer, env)}) -> ${safeLogUrl}`);
     const socket = new WebSocket(connectUrl);
     ws = socket;
 
     socket.addEventListener('open', () => {
-      reconnectAttempt = 0;
       send(
         'bot:hello',
         {
@@ -213,6 +233,7 @@ export function createPeerBridgeClient({ peer, wsUrl, token, env, announceOnBoot
           homeZone: peer.homeZone,
           color: peer.color,
           canDelegate: peer.canDelegate,
+          brainMode,
         },
         `hello-${peer.id}-${Date.now()}`
       );
@@ -222,7 +243,7 @@ export function createPeerBridgeClient({ peer, wsUrl, token, env, announceOnBoot
         greetTimer = setTimeout(() => {
           greetTimer = null;
           send('bot:speech', {
-            text: `Halo tim! ${peer.name} siap bekerja di ${peer.homeZone}.`,
+            text: `Halo tim! ${peer.name} siap bekerja di ${peer.homeZone} (${brainMode}).`,
           });
         }, 700);
       }
@@ -245,11 +266,16 @@ export function createPeerBridgeClient({ peer, wsUrl, token, env, announceOnBoot
         return;
       }
       if (event === 'bot:registered') {
-        console.log(`[${peer.id}] Aktif di zona "${peer.homeZone}" (${peer.name}).`);
+        reconnectAttempt = 0;
+        console.log(`[${peer.id}] Aktif di zona "${peer.homeZone}" (${peer.name}, brain=${brainMode}).`);
         return;
       }
       if (event === 'error') {
-        console.error(`[${peer.id}] Pesan error dari server: ${payload?.message || 'unknown'}`);
+        const msgText = String(payload?.message || 'unknown');
+        if (/unauthorized|invalid.*token/i.test(msgText)) {
+          authRejected = true;
+        }
+        console.error(`[${peer.id}] Pesan error dari server: ${msgText}`);
         return;
       }
       if (event === 'task:assigned' && payload?.taskId) {
@@ -265,13 +291,24 @@ export function createPeerBridgeClient({ peer, wsUrl, token, env, announceOnBoot
       clearTimers();
       if (ws === socket) ws = null;
       if (!stopped) {
+        const isAuthClose =
+          evt.code === 4001 || authRejected || /unauthorized/i.test(evt.reason || '');
+        if (isAuthClose) {
+          console.error(`[${peer.id}] Auth gagal (WS ${evt.code || 4001}): ${AUTH_RETRY_MESSAGE}`);
+          scheduleReconnect(true);
+          return;
+        }
         console.warn(`[${peer.id}] Koneksi ditutup (code=${evt.code}, reason=${evt.reason || 'none'}).`);
-        scheduleReconnect();
+        scheduleReconnect(false);
       }
     });
 
     socket.addEventListener('error', (err) => {
-      console.error(`[${peer.id}] WebSocket error: ${err?.message || 'connection error'}`);
+      const errMsg = String(err?.message || 'connection error');
+      if (/401|unauthorized/i.test(errMsg)) {
+        authRejected = true;
+      }
+      console.error(`[${peer.id}] WebSocket error: ${errMsg}`);
     });
   };
 
@@ -298,10 +335,11 @@ export function createPeerBridgeClient({ peer, wsUrl, token, env, announceOnBoot
 
 function runCli() {
   const args = parseCliArgs();
-  const env = createEnvReader(args.env ? [args.env] : []);
+  const extraFiles = args.env ? [args.env] : [];
+  const env = createEnvReader(extraFiles);
   const wsUrl = args.url || env.get('MUSE_WS_URL', 'wss://musehq.onrender.com/ws/bot');
-  const token = resolveBridgeToken(wsUrl, args.env ? [args.env] : []);
   const peer = resolvePeerPreset(args.bot || env.get('BOT_ID', 'muse-bagas'), env);
+  const token = resolveBridgeToken(wsUrl, extraFiles, peer.id);
 
   const client = createPeerBridgeClient({ peer, wsUrl, token, env });
   client.start();

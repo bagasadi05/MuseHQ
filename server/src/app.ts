@@ -54,6 +54,10 @@ export function createMuseApp(): MuseAppContext {
 
   app.use('/api', createApiRouter(store, orchestrator, bridge));
 
+  if (!IS_SERVERLESS) {
+    orchestrator.startMonitors();
+  }
+
   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
     if (err.message.startsWith('Origin not allowed by CORS')) {
       res.status(403).json({ error: err.message });

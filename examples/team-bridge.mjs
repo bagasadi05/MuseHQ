@@ -10,20 +10,29 @@
 import { createEnvReader } from './lib/env-loader.mjs';
 import { resolveBridgeToken } from './lib/resolve-token.mjs';
 import { resolveTeamPresets } from './lib/peer-presets.mjs';
+import { describeBrainMode } from './lib/brain-adapter.mjs';
 import { createPeerBridgeClient, parseCliArgs } from './muse-peer-bridge.mjs';
 
 const args = parseCliArgs();
 const extraFiles = args.env ? [args.env] : [];
 const env = createEnvReader(extraFiles);
 const wsUrl = args.url || env.get('MUSE_WS_URL', 'wss://musehq.onrender.com/ws/bot');
-const token = resolveBridgeToken(wsUrl, extraFiles);
 const peers = resolveTeamPresets(args.bots || env.get('MUSE_TEAM_BOTS'), env);
 
 console.log(
-  `[TeamBridge] Menghubungkan ${peers.length} bot (${peers.map((p) => p.id).join(', ')}) ke ${wsUrl}...`
+  `[TeamBridge] Menghubungkan ${peers.length} bot (${peers
+    .map((p) => `${p.id}[${describeBrainMode(p, env)}]`)
+    .join(', ')}) ke ${wsUrl}...`
 );
 
-const clients = peers.map((peer) => createPeerBridgeClient({ peer, wsUrl, token, env }));
+const clients = peers.map((peer) =>
+  createPeerBridgeClient({
+    peer,
+    wsUrl,
+    token: resolveBridgeToken(wsUrl, extraFiles, peer.id),
+    env,
+  })
+);
 
 clients.forEach((client, index) => {
   if (index === 0) {

@@ -41,12 +41,66 @@ function isLocalTarget(targetUrl) {
   }
 }
 
+export const AUTH_RETRY_MESSAGE =
+  'token tidak cocok dengan server — periksa BOT_BRIDGE_TOKEN di dashboard Render';
+
+/** Computes exponential backoff in milliseconds starting at 5s and capping at 60s on auth rejection. */
+export function computeAuthBackoffMs(attempt = 0) {
+  const safeAttempt = Math.max(0, Math.min(6, Number(attempt) || 0));
+  return Math.min(60_000, 5_000 * 2 ** safeAttempt);
+}
+
+function parseBotTokenMap(rawMap) {
+  const result = {};
+  const trimmed = (rawMap || '').trim();
+  if (!trimmed) return result;
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        for (const [k, v] of Object.entries(parsed)) {
+          if (typeof v === 'string' && isUsableToken(v)) {
+            result[k.trim()] = v.trim();
+          }
+        }
+      }
+    } catch {
+      // Ignore invalid JSON map
+    }
+    return result;
+  }
+  for (const part of trimmed.split(/[,;\n]/)) {
+    const eq = part.indexOf('=');
+    if (eq <= 0) continue;
+    const id = part.slice(0, eq).trim();
+    const tok = part.slice(eq + 1).trim();
+    if (id && isUsableToken(tok)) {
+      result[id] = tok;
+    }
+  }
+  return result;
+}
+
 /**
- * Resolves BOT_BRIDGE_TOKEN strictly from environment variables, untracked local
- * `.env.bridge` / `.env` / `server/.env` files, or local dev settings.json.
+ * Resolves a bridge token for an optional `botId` (per-bot token env/map first, then shared
+ * `BOT_BRIDGE_TOKEN`), falling back to local `server/data/settings.json` only for localhost URLs.
  */
-export function resolveBridgeToken(targetUrl, extraEnvFiles = []) {
+export function resolveBridgeToken(targetUrl, extraEnvFiles = [], botId = '') {
   const env = createEnvReader(extraEnvFiles);
+  const cleanBotId = String(botId || '').trim();
+
+  if (cleanBotId) {
+    const upperKey = cleanBotId.toUpperCase().replace(/[^A-Z0-9]+/g, '_');
+    for (const envName of [`BOT_BRIDGE_TOKEN_${upperKey}`, `${upperKey}_BRIDGE_TOKEN`]) {
+      const direct = env.get(envName);
+      if (isUsableToken(direct)) return direct;
+    }
+    const tokenMap = parseBotTokenMap(env.get('BOT_BRIDGE_TOKENS'));
+    if (tokenMap[cleanBotId]) {
+      return tokenMap[cleanBotId];
+    }
+  }
+
   const candidate = env.get('BOT_BRIDGE_TOKEN');
   if (isUsableToken(candidate)) {
     return candidate;
@@ -58,6 +112,13 @@ export function resolveBridgeToken(targetUrl, extraEnvFiles = []) {
     if (fs.existsSync(settingsPath)) {
       try {
         const parsed = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+        const perBotLocal =
+          cleanBotId && parsed.botTokens && typeof parsed.botTokens[cleanBotId] === 'string'
+            ? parsed.botTokens[cleanBotId].trim()
+            : '';
+        if (isUsableToken(perBotLocal)) {
+          return perBotLocal;
+        }
         const localToken = typeof parsed.bridgeToken === 'string' ? parsed.bridgeToken.trim() : '';
         if (isUsableToken(localToken)) {
           return localToken;
@@ -70,9 +131,9 @@ export function resolveBridgeToken(targetUrl, extraEnvFiles = []) {
 
   console.error(
     [
-      '[MuseBot] BOT_BRIDGE_TOKEN tidak ditemukan atau masih memakai nilai placeholder.',
+      `[MuseBot${cleanBotId ? `:${cleanBotId}` : ''}] Token bridge tidak ditemukan atau masih memakai nilai placeholder.`,
       `Target: ${targetUrl}`,
-      'Isi di `.env.bridge` (salin dari `.env.bridge.example`) atau set env var BOT_BRIDGE_TOKEN:',
+      'Isi BOT_BRIDGE_TOKENS / BOT_BRIDGE_TOKEN_<BOT> atau BOT_BRIDGE_TOKEN di `.env.bridge` (salin dari `.env.bridge.example`):',
       '  PowerShell: $env:BOT_BRIDGE_TOKEN="<token-anda>"; npm run bridge:team',
       '  Bash:       BOT_BRIDGE_TOKEN="<token-anda>" npm run bridge:team',
     ].join('\n')

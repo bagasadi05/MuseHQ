@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import {
+  AlertTriangle,
   Bot,
   Cpu,
   KeyRound,
@@ -37,6 +38,8 @@ export default function App() {
     comms,
     beams,
     settings,
+    stateResetNotice,
+    dismissResetNotice,
     login,
     logout,
     launchMission,
@@ -49,6 +52,9 @@ export default function App() {
     updateSettings,
     clearHistory,
     resetWorkspace,
+    cancelTask,
+    markTaskFailed,
+    reassignTask,
   } = useMuseSocket();
 
   const [passcodeInput, setPasscodeInput] = useState('');
@@ -305,6 +311,31 @@ SESSION_SECRET=<string-acak-32-karakter>`}
         </div>
       </header>
 
+      {stateResetNotice && (
+        <div
+          role="status"
+          className="flex shrink-0 items-center justify-between gap-3 border-b border-amber-500/40 bg-amber-950/90 px-4 py-2 text-xs text-amber-100"
+        >
+          <div className="flex min-w-0 items-center gap-2">
+            <AlertTriangle className="h-4 w-4 shrink-0 text-amber-400" />
+            <div className="min-w-0">
+              <span className="font-semibold">{stateResetNotice}</span>{' '}
+              <span className="text-amber-200/85">
+                Pasang Render Disk (/data) atau jalankan bot Anda lagi untuk menyambung ulang.
+              </span>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={dismissResetNotice}
+            className="shrink-0 rounded p-1 text-amber-300 transition hover:bg-amber-900/60 cursor-pointer"
+            aria-label="Tutup peringatan reset"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
+
       {/* Main Workspace Area */}
       <div className="relative flex min-h-0 flex-1 overflow-hidden">
         {/* Left / Center Isometric Virtual Office Viewport */}
@@ -399,6 +430,27 @@ SESSION_SECRET=<string-acak-32-karakter>`}
               }}
               onSendBotCommand={async (fromId, toId, content, createTask, title) => {
                 await sendBotCommand(fromId, toId, content, createTask, title);
+              }}
+              onCancelTask={async (taskId) => {
+                try {
+                  await cancelTask(taskId);
+                } catch (err) {
+                  showError(err instanceof Error ? err.message : 'Gagal membatalkan tugas');
+                }
+              }}
+              onMarkTaskFailed={async (taskId, reason) => {
+                try {
+                  await markTaskFailed(taskId, reason);
+                } catch (err) {
+                  showError(err instanceof Error ? err.message : 'Gagal menandai tugas gagal');
+                }
+              }}
+              onReassignTask={async (taskId, targetAgentId) => {
+                try {
+                  await reassignTask(taskId, targetAgentId);
+                } catch (err) {
+                  showError(err instanceof Error ? err.message : 'Gagal menugaskan ulang');
+                }
               }}
               onOpenReport={(m) => setReportMission(m)}
               onClearHistory={async () => {
