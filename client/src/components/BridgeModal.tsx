@@ -81,12 +81,22 @@ curl -X POST ${apiBase}/bridge/bots/muse-rest-scout/event \\
   -H "x-muse-token: $BOT_BRIDGE_TOKEN" \\
   -d '{"event":"task:complete","eventId":"done-1","payload":{"taskId":"task-id","speech":"Selesai!","result":"Laporan Markdown"}}'`;
 
-  const peersSnippet = `// Rekan setara yang tersambung ke MuseHQ via bot:hello:
+  const peersSnippet = `// 1. Hubungkan sekaligus 4 agen (muse-bagas, muse-arif, muse-niro, muse-joni):
+// Salin .env.bridge.example -> .env.bridge, isi BOT_BRIDGE_TOKEN (& API key / UPSTREAM_URL bila ada)
+// lalu jalankan dari root repo:
+//   MUSE_WS_URL="${wsBase}" npm run bridge:team
+
+// 2. Atau jalankan terpisah per mesin/personil:
+//   BOT_BRIDGE_TOKEN=<token> MUSE_WS_URL="${wsBase}" npm run bridge:bot -- --bot=muse-bagas
+//   BOT_BRIDGE_TOKEN=<token> MUSE_WS_URL="${wsBase}" npm run bridge:bot -- --bot=muse-arif
+//   BOT_BRIDGE_TOKEN=<token> MUSE_WS_URL="${wsBase}" npm run bridge:bot -- --bot=muse-niro
+//   BOT_BRIDGE_TOKEN=<token> MUSE_WS_URL="${wsBase}" npm run bridge:bot -- --bot=muse-joni
+
 const REAL_AGENTS = [
-  { id: 'muse-bagas', name: 'Muse Bagas', role: 'Lead Architect (Owner Muse)', homeZone: 'command-desk', color: '#f59e0b', canDelegate: true },
-  { id: 'muse-arif',  name: 'Muse Arif',  role: 'Peer Specialist', homeZone: 'research-library', color: '#06b6d4', canDelegate: true },
-  { id: 'muse-joni',  name: 'Muse Joni',  role: 'Peer Engineer',   homeZone: 'engineering-bay',  color: '#10b981', canDelegate: true },
-  { id: 'muse-niro',  name: 'Muse Niro',  role: 'Peer Creative & QA', homeZone: 'creative-studio', color: '#ec4899', canDelegate: true },
+  { id: 'muse-bagas', name: 'Muse Bagas', role: 'Lead Architect',    homeZone: 'command-desk',     color: '#f59e0b', canDelegate: true },
+  { id: 'muse-arif',  name: 'Muse Arif',  role: 'Research & Strategy', homeZone: 'research-library', color: '#06b6d4', canDelegate: true },
+  { id: 'muse-niro',  name: 'Muse Niro',  role: 'Creative & QA Lead',  homeZone: 'creative-studio',  color: '#ec4899', canDelegate: true },
+  { id: 'muse-joni',  name: 'Muse Joni',  role: 'Systems Engineer',  homeZone: 'engineering-bay',  color: '#10b981', canDelegate: true },
 ];`;
 
   const copyText = (key: string, text: string) => {

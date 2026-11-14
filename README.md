@@ -87,16 +87,24 @@ npm run example:rest-bot
 ```
 `Muse REST Worker` (`muse-rest-worker`, zona default `qa-bench`, interval `POLL_MS=2500` min `1000`) mendaftar via `POST /api/bridge/bots/muse-rest-worker/event`, membaca `GET /api/state?since=<cursor>`, mengirim `bot:heartbeat` tiap siklus, dan melaporkan hasil tanpa duplikasi saat polling diulang. Jika menargetkan preview Vercel yang diproteksi Deployment Protection, tambahkan `VERCEL_BYPASS_SECRET` (dikirim via header `x-vercel-protection-bypass`).
 
-### 3. Menghubungkan 4 Agen Rekan Nyata Sekaligus
-Keempat ID agen berikut diperlakukan sebagai **rekan setara** di ruangan (tidak dibatasi kuota delegasi):
-- `muse-bagas` (disarankan `homeZone: "command-desk"`)
-- `muse-arif` (mis. `research-library` / `engineering-bay`)
-- `muse-joni` (mis. `engineering-bay` / `creative-studio`)
-- `muse-niro` (mis. `qa-bench` / `war-room`)
+### 3. Menghubungkan 4 Agen Rekan Nyata Sekaligus (`muse-bagas`, `muse-arif`, `muse-niro`, `muse-joni`)
+Keempat ID agen berikut diperlakukan sebagai **rekan setara** di ruangan (tanpa batas kuota delegasi):
+- `muse-bagas` (`Muse Bagas` — `command-desk`)
+- `muse-arif` (`Muse Arif` — `research-library`)
+- `muse-niro` (`Muse Niro` — `creative-studio`)
+- `muse-joni` (`Muse Joni` — `engineering-bay`)
 
-Setiap agen dapat dijalankan di mesin/proses berbeda dengan `BOT_ID` & `BOT_HOME_ZONE`:
+Gunakan launcher siap pakai [examples/team-bridge.mjs](examples/team-bridge.mjs) (mendukung auto-reconnect WebSocket, Cloud LLM API di `.env.bridge`/`.env`, serta penerusan ke endpoint bot terpisah via `*_UPSTREAM_URL`):
 ```bash
-BOT_ID=muse-bagas BOT_NAME="Muse Bagas" BOT_HOME_ZONE=command-desk BOT_BRIDGE_TOKEN="<TOKEN>" MUSE_WS_URL="wss://domain-anda.com/ws/bot" node examples/external-bot.mjs
+# 1. Salin template lalu isi BOT_BRIDGE_TOKEN (+ API key / UPSTREAM_URL bila ada):
+cp .env.bridge.example .env.bridge
+
+# 2. Jalankan ke-4 bot sekaligus ke Render/VPS/lokal:
+npm run bridge:team
+```
+Atau jalankan masing-masing bot dari mesin/terminal berbeda lewat [examples/muse-peer-bridge.mjs](examples/muse-peer-bridge.mjs):
+```bash
+BOT_BRIDGE_TOKEN="<TOKEN>" MUSE_WS_URL="wss://musehq.onrender.com/ws/bot" npm run bridge:bot -- --bot=muse-arif
 ```
 
 ---

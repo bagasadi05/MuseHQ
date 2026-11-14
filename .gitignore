@@ -3,6 +3,7 @@ dist/
 .env
 .env.*
 !.env.example
+!.env.bridge.example
 server/.env
 server/.env.*
 server/data/
