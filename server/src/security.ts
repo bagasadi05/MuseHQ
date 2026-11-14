@@ -157,7 +157,7 @@ export function getAllowedOrigins(): Set<string> {
   const rawEnv = process.env.ALLOWED_ORIGINS || '';
   for (const item of rawEnv.split(',')) {
     const clean = item.trim().replace(/\/+$/, '');
-    if (clean) origins.add(clean);
+    if (clean && clean !== '*') origins.add(clean);
   }
 
   for (const envHost of [

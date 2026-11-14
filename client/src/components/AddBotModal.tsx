@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Bot, Plus, X } from 'lucide-react';
 import { Agent, AgentType, AvatarVariant, LLMProvider, ZONES_META, ZoneId } from '../types';
 
@@ -28,6 +28,13 @@ export const AddBotModal: React.FC<AddBotModalProps> = ({
   const [systemPrompt, setSystemPrompt] = useState('');
   const [canDelegate, setCanDelegate] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    setProvider(defaultProvider);
+    setErrorMsg(null);
+  }, [open, defaultProvider]);
 
   if (!open) return null;
 
@@ -35,6 +42,7 @@ export const AddBotModal: React.FC<AddBotModalProps> = ({
     e.preventDefault();
     if (!name.trim() || !role.trim()) return;
     setSaving(true);
+    setErrorMsg(null);
     try {
       await onCreate({
         name: name.trim(),
@@ -53,6 +61,8 @@ export const AddBotModal: React.FC<AddBotModalProps> = ({
       setSystemPrompt('');
       setWebhookUrl('');
       onClose();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Gagal menambahkan bot');
     } finally {
       setSaving(false);
     }
@@ -216,6 +226,12 @@ export const AddBotModal: React.FC<AddBotModalProps> = ({
             />
             <span>Izinkan bot ini memberi perintah & mendelegasikan tugas ke bot lain</span>
           </label>
+
+          {errorMsg && (
+            <div className="rounded-lg border border-rose-500/40 bg-rose-950/40 px-3 py-2 text-rose-200">
+              {errorMsg}
+            </div>
+          )}
 
           <div className="mt-2 flex justify-end gap-2">
             <button

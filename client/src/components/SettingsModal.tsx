@@ -9,6 +9,7 @@ interface SettingsModalProps {
   onClose: () => void;
   onSaveSettings: (patch: Record<string, string>) => Promise<void>;
   onApplyProviderToAll: (provider: LLMProvider) => Promise<void>;
+  onUpdateBotProvider: (agentId: string, provider: LLMProvider) => Promise<void>;
 }
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({
@@ -18,6 +19,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onClose,
   onSaveSettings,
   onApplyProviderToAll,
+  onUpdateBotProvider,
 }) => {
   const [defaultProvider, setDefaultProvider] = useState<LLMProvider>(settings.defaultProvider);
   const [geminiApiKey, setGeminiApiKey] = useState('');
@@ -29,8 +31,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [bridgeToken, setBridgeToken] = useState('');
   const [ownerPasscode, setOwnerPasscode] = useState('');
   const [applyAll, setApplyAll] = useState(true);
+  const [botProviders, setBotProviders] = useState<Record<string, LLMProvider>>({});
   const [saving, setSaving] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  const builtinAgents = agents.filter((a) => a.type === 'builtin');
 
   useEffect(() => {
     if (!open) return;
@@ -43,8 +48,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setGeminiApiKey('');
     setOpenaiApiKey('');
     setAnthropicApiKey('');
+    const nextMap: Record<string, LLMProvider> = {};
+    for (const a of agents) {
+      if (a.type === 'builtin') nextMap[a.id] = a.provider;
+    }
+    setBotProviders(nextMap);
     setErrorMsg(null);
-  }, [open, settings]);
+  }, [open, settings, agents]);
 
   if (!open) return null;
 
@@ -66,9 +76,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       if (ownerPasscode.trim()) patch.ownerPasscode = ownerPasscode.trim();
 
       await onSaveSettings(patch);
-      if (applyAll && agents.length > 0) {
+      if (applyAll && builtinAgents.length > 0) {
         await onApplyProviderToAll(defaultProvider);
+      } else if (!applyAll && builtinAgents.length > 0) {
+        const changed = builtinAgents.filter(
+          (a) => botProviders[a.id] && botProviders[a.id] !== a.provider
+        );
+        await Promise.all(changed.map((a) => onUpdateBotProvider(a.id, botProviders[a.id])));
       }
+      setBridgeToken('');
+      setOwnerPasscode('');
+      setGeminiApiKey('');
+      setOpenaiApiKey('');
+      setAnthropicApiKey('');
       onClose();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Gagal menyimpan pengaturan');
@@ -79,7 +99,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/75 p-4 backdrop-blur-sm">
-      <div className="w-full max-w-lg rounded-2xl border border-slate-700/80 bg-slate-900 shadow-2xl">
+      <div className="flex max-h-[90vh] w-full max-w-lg flex-col rounded-2xl border border-slate-700/80 bg-slate-900 shadow-2xl">
         <div className="flex items-center justify-between border-b border-slate-800 px-5 py-3.5">
           <div className="flex items-center gap-2">
             <KeyRound className="h-4 w-4 text-amber-400" />
@@ -96,7 +116,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           </button>
         </div>
 
-        <form onSubmit={handleSubmit} className="space-y-3.5 p-5 text-xs">
+        <form onSubmit={handleSubmit} className="space-y-3.5 overflow-y-auto p-5 text-xs">
           <div>
             <label className="mb-1 block font-medium text-slate-300">Provider AI Default</label>
             <select
@@ -115,15 +135,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             <div>
               <div className="mb-1 flex items-center justify-between">
                 <label className="font-medium text-sky-300">Google Gemini API Key</label>
-                {settings.hasGeminiKey && (
+                {settings.hasGeminiKey ? (
                   <span className="font-mono text-[10px] text-emerald-400">
                     Aktif ({settings.geminiKeyPreview})
                   </span>
+                ) : (
+                  <span className="font-mono text-[10px] text-slate-500">Belum diatur</span>
                 )}
               </div>
               <div className="grid grid-cols-3 gap-2">
                 <input
                   type="password"
+                  autoComplete="new-password"
                   value={geminiApiKey}
                   onChange={(e) => setGeminiApiKey(e.target.value)}
                   placeholder={settings.hasGeminiKey ? 'Isi untuk mengganti...' : 'AIza...'}
@@ -142,15 +165,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             <div>
               <div className="mb-1 flex items-center justify-between">
                 <label className="font-medium text-emerald-300">OpenAI API Key</label>
-                {settings.hasOpenaiKey && (
+                {settings.hasOpenaiKey ? (
                   <span className="font-mono text-[10px] text-emerald-400">
                     Aktif ({settings.openaiKeyPreview})
                   </span>
+                ) : (
+                  <span className="font-mono text-[10px] text-slate-500">Belum diatur</span>
                 )}
               </div>
               <div className="grid grid-cols-3 gap-2">
                 <input
                   type="password"
+                  autoComplete="new-password"
                   value={openaiApiKey}
                   onChange={(e) => setOpenaiApiKey(e.target.value)}
                   placeholder={settings.hasOpenaiKey ? 'Isi untuk mengganti...' : 'sk-...'}
@@ -169,15 +195,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             <div>
               <div className="mb-1 flex items-center justify-between">
                 <label className="font-medium text-amber-300">Anthropic Claude API Key</label>
-                {settings.hasAnthropicKey && (
+                {settings.hasAnthropicKey ? (
                   <span className="font-mono text-[10px] text-emerald-400">
                     Aktif ({settings.anthropicKeyPreview})
                   </span>
+                ) : (
+                  <span className="font-mono text-[10px] text-slate-500">Belum diatur</span>
                 )}
               </div>
               <div className="grid grid-cols-3 gap-2">
                 <input
                   type="password"
+                  autoComplete="new-password"
                   value={anthropicApiKey}
                   onChange={(e) => setAnthropicApiKey(e.target.value)}
                   placeholder={settings.hasAnthropicKey ? 'Isi untuk mengganti...' : 'sk-ant-...'}
@@ -198,14 +227,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             <div>
               <div className="mb-1 flex items-center justify-between">
                 <label className="text-slate-300">Ganti BOT_BRIDGE_TOKEN</label>
-                {settings.hasBridgeToken && (
+                {settings.hasBridgeToken ? (
                   <span className="font-mono text-[10px] text-emerald-400">
                     {settings.bridgeTokenPreview}
                   </span>
+                ) : (
+                  <span className="font-mono text-[10px] text-slate-500">Belum diatur</span>
                 )}
               </div>
               <input
                 type="password"
+                autoComplete="new-password"
                 value={bridgeToken}
                 onChange={(e) => setBridgeToken(e.target.value)}
                 placeholder="Isi token baru (min 8 karakter)..."
@@ -214,9 +246,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
 
             <div>
-              <label className="mb-1 block text-slate-300">Ganti Owner Passcode</label>
+              <div className="mb-1 flex items-center justify-between">
+                <label className="text-slate-300">Ganti Owner Passcode</label>
+                <span className="font-mono text-[10px] text-emerald-400">
+                  {settings.authConfigured ? 'Aktif' : 'Belum diatur'}
+                </span>
+              </div>
               <input
                 type="password"
+                autoComplete="new-password"
                 value={ownerPasscode}
                 onChange={(e) => setOwnerPasscode(e.target.value)}
                 placeholder="Kosongkan jika tetap..."
@@ -240,6 +278,34 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             />
             <span>Terapkan provider default ini ke semua bot built-in di ruangan</span>
           </label>
+
+          {!applyAll && builtinAgents.length > 0 && (
+            <div className="space-y-1.5 rounded-xl border border-slate-800 bg-slate-950/60 p-3">
+              <div className="text-[11px] font-medium text-slate-400">
+                Provider Per-Bot (Built-in)
+              </div>
+              {builtinAgents.map((a) => (
+                <div key={a.id} className="flex items-center justify-between gap-2">
+                  <span className="truncate text-slate-200">{a.name}</span>
+                  <select
+                    value={botProviders[a.id] || a.provider}
+                    onChange={(e) =>
+                      setBotProviders((prev) => ({
+                        ...prev,
+                        [a.id]: e.target.value as LLMProvider,
+                      }))
+                    }
+                    className="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-[11px] text-slate-100 outline-none"
+                  >
+                    <option value="demo">demo</option>
+                    <option value="gemini">gemini</option>
+                    <option value="openai">openai</option>
+                    <option value="anthropic">anthropic</option>
+                  </select>
+                </div>
+              ))}
+            </div>
+          )}
 
           <div className="flex justify-end gap-2 pt-1">
             <button

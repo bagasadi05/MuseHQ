@@ -4,7 +4,7 @@ import { Agent } from '../types';
 
 interface CommandBarProps {
   agents: Agent[];
-  onLaunchMission: (prompt: string, targetAgentId: string) => Promise<void>;
+  onLaunchMission: (prompt: string, targetAgentId: string) => Promise<boolean | void>;
   isRunningMission: boolean;
 }
 
@@ -46,8 +46,10 @@ export const CommandBar: React.FC<CommandBarProps> = ({
     if (!text || submitting) return;
     setSubmitting(true);
     try {
-      await onLaunchMission(text, selectedTarget?.id || 'muse-lead');
-      setPrompt('');
+      const ok = await onLaunchMission(text, selectedTarget?.id || 'muse-lead');
+      if (ok !== false) {
+        setPrompt('');
+      }
     } finally {
       setSubmitting(false);
     }

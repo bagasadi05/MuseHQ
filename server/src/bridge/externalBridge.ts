@@ -1,7 +1,7 @@
 import { IncomingMessage } from 'node:http';
 import { WebSocket, WebSocketServer } from 'ws';
 import { normalizeZoneId, pickSpotInZone } from '../officeMap.js';
-import { isRetiredToken, timingSafeEqualStr } from '../security.js';
+import { extractBearerOrHeaderToken, isRetiredToken, timingSafeEqualStr } from '../security.js';
 import { WorkspaceStore } from '../store.js';
 import { Agent, AgentStatus, CommsMessage, Task, ZoneId } from '../types.js';
 
@@ -38,6 +38,7 @@ export interface BridgeHandlers {
 }
 
 const VALID_BOT_ID_RE = /^[a-z0-9][a-z0-9_-]{1,63}$/i;
+const WS_PING_INTERVAL_MS = 25_000;
 
 const ALLOWED_BRIDGE_EVENTS = new Set([
   'bot:hello',
@@ -47,6 +48,7 @@ const ALLOWED_BRIDGE_EVENTS = new Set([
   'bot:speech',
   'bot:message',
   'bot:heartbeat',
+  'bot:delegate',
   'task:accept',
   'task:delegate',
   'task:complete',
@@ -59,12 +61,13 @@ const VALID_STATUSES: AgentStatus[] = [
   'walking',
   'thinking',
   'working',
+  'talking',
   'meeting',
   'offline',
   'error',
 ];
 
-function normalizeAgentStatus(raw: unknown): AgentStatus | null {
+export function normalizeAgentStatus(raw: unknown): AgentStatus | null {
   if (typeof raw !== 'string') return null;
   const trimmed = raw.trim().toLowerCase();
   if (trimmed === 'in-progress') return 'working';
@@ -72,6 +75,25 @@ function normalizeAgentStatus(raw: unknown): AgentStatus | null {
     return trimmed as AgentStatus;
   }
   return null;
+}
+
+export function validateWebhookUrl(raw: unknown): string | undefined {
+  if (raw === undefined || raw === null || raw === '') return undefined;
+  if (typeof raw !== 'string') {
+    throw new BridgeValidationError('Field "webhookUrl" harus berupa string URL yang valid');
+  }
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new BridgeValidationError('webhookUrl harus menggunakan protokol http:// atau https://');
+    }
+    return parsed.toString();
+  } catch (err) {
+    if (err instanceof BridgeValidationError) throw err;
+    throw new BridgeValidationError('Format webhookUrl tidak valid');
+  }
 }
 
 export class ExternalBridge {
@@ -137,6 +159,10 @@ export class ExternalBridge {
       this.uiClients.add(ws);
       ws.send(JSON.stringify({ event: 'snapshot', payload: this.store.getSnapshot() }));
 
+      ws.on('error', () => {
+        this.uiClients.delete(ws);
+      });
+
       ws.on('close', () => {
         this.uiClients.delete(ws);
       });
@@ -148,11 +174,15 @@ export class ExternalBridge {
   }
 
   private handleBotConnection(ws: WebSocket, req: IncomingMessage): void {
-    const url = new URL(req.url || '/', 'http://localhost');
-    const token = (
-      url.searchParams.get('token') ||
-      (typeof req.headers['x-muse-token'] === 'string' ? req.headers['x-muse-token'] : '')
-    ).trim();
+    let url: URL;
+    try {
+      url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    } catch {
+      ws.close(1008, 'Invalid request URL');
+      return;
+    }
+
+    const token = (url.searchParams.get('token') || extractBearerOrHeaderToken(req)).trim();
     const expectedToken = this.store.getSettings().bridgeToken;
 
     if (!token || isRetiredToken(token) || !timingSafeEqualStr(token, expectedToken)) {
@@ -173,9 +203,32 @@ export class ExternalBridge {
       }
     }
 
+    const pingTimer = setInterval(() => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      try {
+        ws.ping();
+        ws.send(JSON.stringify({ event: 'ping', payload: { timestamp: new Date().toISOString() } }));
+      } catch {
+        // Ignore send errors on closing sockets
+      }
+    }, WS_PING_INTERVAL_MS);
+    pingTimer.unref?.();
+
+    const clearPingTimer = () => {
+      clearInterval(pingTimer);
+    };
+
+    ws.on('error', () => {
+      clearPingTimer();
+    });
+
     ws.on('message', async (raw) => {
       try {
-        const msg = JSON.parse(raw.toString()) as {
+        const parsed = JSON.parse(raw.toString()) as unknown;
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          throw new BridgeValidationError('Pesan bridge harus berupa objek JSON');
+        }
+        const msg = parsed as {
           event?: unknown;
           payload?: unknown;
           eventId?: unknown;
@@ -184,19 +237,67 @@ export class ExternalBridge {
           throw new BridgeValidationError('Field "event" wajib berupa string');
         }
         const event = msg.event.trim();
+
+        if (event === 'ping') {
+          ws.send(JSON.stringify({ event: 'pong', payload: { timestamp: new Date().toISOString() } }));
+          return;
+        }
+        if (event === 'pong') {
+          if (boundAgentId) {
+            const existing = this.store.getAgent(boundAgentId);
+            if (existing) {
+              this.store.updateAgent(boundAgentId, {
+                bridgeConnected: true,
+                status: existing.status === 'offline' ? 'online' : existing.status,
+              });
+            }
+          }
+          return;
+        }
+
         if (!ALLOWED_BRIDGE_EVENTS.has(event)) {
           throw new BridgeValidationError(`Event bridge tidak dikenal: ${event}`);
         }
+        if (
+          msg.payload !== undefined &&
+          (msg.payload === null || typeof msg.payload !== 'object' || Array.isArray(msg.payload))
+        ) {
+          throw new BridgeValidationError('Field "payload" harus berupa objek JSON');
+        }
+        if (msg.eventId !== undefined && typeof msg.eventId !== 'string') {
+          throw new BridgeValidationError('Field "eventId" harus berupa string');
+        }
+
         const payload =
           msg.payload && typeof msg.payload === 'object' && !Array.isArray(msg.payload)
-            ? (msg.payload as Record<string, unknown>)
+            ? { ...(msg.payload as Record<string, unknown>) }
             : {};
+        const clientEventId =
+          typeof msg.eventId === 'string' && msg.eventId.trim()
+            ? msg.eventId.trim()
+            : typeof payload.eventId === 'string' && payload.eventId.trim()
+              ? payload.eventId.trim()
+              : '';
+        if (clientEventId) {
+          payload.eventId = clientEventId;
+        }
 
         if (event === 'bot:hello' || event === 'bot:register') {
           const requestedId =
             typeof payload.id === 'string' && payload.id.trim()
               ? payload.id.trim()
               : boundAgentId || undefined;
+          if (requestedId && clientEventId && this.store.hasBridgeEventId(requestedId, clientEventId)) {
+            const existing = this.store.getAgent(requestedId);
+            if (existing) {
+              boundAgentId = existing.id;
+              this.bindSocketToAgent(existing.id, ws);
+              ws.send(
+                JSON.stringify({ event: 'bot:registered', payload: { agent: existing, duplicate: true } })
+              );
+              return;
+            }
+          }
           const agent = this.registerOrUpdateExternalBot({
             id: requestedId,
             name: typeof payload.name === 'string' ? payload.name : 'External Muse Bot',
@@ -210,6 +311,9 @@ export class ExternalBridge {
             canDelegate: Boolean(payload.canDelegate),
             type: 'external-ws',
           });
+          if (clientEventId) {
+            this.store.recordBridgeEventId(agent.id, clientEventId);
+          }
           boundAgentId = agent.id;
           this.bindSocketToAgent(agent.id, ws);
           ws.send(JSON.stringify({ event: 'bot:registered', payload: { agent } }));
@@ -222,9 +326,6 @@ export class ExternalBridge {
           );
         }
 
-        if (typeof msg.eventId === 'string' && msg.eventId.trim()) {
-          payload.eventId = msg.eventId.trim();
-        }
         await this.processBotEvent(boundAgentId, event, payload);
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Invalid bridge message';
@@ -233,6 +334,7 @@ export class ExternalBridge {
     });
 
     ws.on('close', () => {
+      clearPingTimer();
       if (!boundAgentId) return;
       const existing = this.botSockets.get(boundAgentId);
       if (existing === ws) {
@@ -263,6 +365,7 @@ export class ExternalBridge {
 
   private bindSocketToAgent(agentId: string, ws: WebSocket): void {
     const prev = this.botSockets.get(agentId);
+    const alreadySameSocket = prev === ws;
     if (prev && prev !== ws && prev.readyState === WebSocket.OPEN) {
       prev.close(4002, 'Replaced by new connection');
     }
@@ -273,17 +376,19 @@ export class ExternalBridge {
       this.store.updateAgent(agentId, {
         type: 'external-ws',
         bridgeConnected: true,
-        status: 'online',
+        status: agent.status === 'offline' ? 'online' : agent.status === 'idle' ? 'online' : agent.status,
       });
-      this.store.setSpeechBubble(agentId, 'Terhubung ke ruangan!', 'chat', 4000);
-      this.store.addComms({
-        fromId: agent.id,
-        fromName: agent.name,
-        toId: 'all',
-        toName: 'All Muse Bots',
-        kind: 'system',
-        content: `${agent.name} masuk ke ruangan kerja via WebSocket Bridge.`,
-      });
+      if (!alreadySameSocket) {
+        this.store.setSpeechBubble(agentId, 'Terhubung ke ruangan!', 'chat', 4000);
+        this.store.addComms({
+          fromId: agent.id,
+          fromName: agent.name,
+          toId: 'all',
+          toName: 'All Muse Bots',
+          kind: 'system',
+          content: `${agent.name} masuk ke ruangan kerja via WebSocket Bridge.`,
+        });
+      }
     }
   }
 
@@ -319,6 +424,14 @@ export class ExternalBridge {
     }
 
     const existing = this.store.getAgent(slug);
+    if (existing && existing.type === 'builtin') {
+      throw new BridgeValidationError(
+        `ID "${slug}" adalah bot built-in dan tidak dapat ditimpa melalui External Bridge`,
+        409
+      );
+    }
+
+    const validatedWebhook = validateWebhookUrl(input.webhookUrl);
     let zone: ZoneId = existing?.homeZone || 'qa-bench';
     if (input.homeZone !== undefined && input.homeZone !== null && input.homeZone !== '') {
       const normalized = normalizeZoneId(input.homeZone);
@@ -348,7 +461,7 @@ export class ExternalBridge {
         color: input.color?.trim() || existing.color,
         canDelegate: input.canDelegate ?? existing.canDelegate,
         type: input.type,
-        webhookUrl: input.webhookUrl ?? existing.webhookUrl,
+        webhookUrl: validatedWebhook ?? existing.webhookUrl,
         bridgeConnected: true,
         status: existing.status === 'offline' ? 'online' : existing.status,
       });
@@ -366,7 +479,7 @@ export class ExternalBridge {
       type: input.type,
       provider: 'demo',
       model: 'external',
-      webhookUrl: input.webhookUrl,
+      webhookUrl: validatedWebhook,
       bridgeConnected: true,
       canDelegate: Boolean(input.canDelegate),
       homeZone: zone,
@@ -404,7 +517,7 @@ export class ExternalBridge {
         : typeof payload.clientEventId === 'string'
           ? payload.clientEventId.trim()
           : '';
-    if (clientEventId && !this.store.recordBridgeEventId(agentId, clientEventId)) {
+    if (clientEventId && this.store.hasBridgeEventId(agentId, clientEventId)) {
       return { ok: true, duplicate: true };
     }
 
@@ -437,6 +550,10 @@ export class ExternalBridge {
         webhookUrl,
       });
 
+      if (clientEventId) {
+        this.store.recordBridgeEventId(agentId, clientEventId);
+      }
+
       if (!existing) {
         this.store.addComms({
           fromId: registered.id,
@@ -459,6 +576,7 @@ export class ExternalBridge {
     }
 
     if (event === 'bot:heartbeat') {
+      if (clientEventId) this.store.recordBridgeEventId(agentId, clientEventId);
       this.store.updateAgent(agentId, {
         bridgeConnected: true,
         status: agent.status === 'offline' ? 'online' : agent.status,
@@ -485,15 +603,29 @@ export class ExternalBridge {
         nextZone = parsedZone;
       }
 
-      if (nextZone) {
-        this.store.moveAgentToZone(agentId, nextZone, 0, nextStatus);
-      } else if (nextStatus) {
-        this.store.updateAgent(agentId, { status: nextStatus, bridgeConnected: true });
+      if (payload.speech !== undefined && typeof payload.speech !== 'string') {
+        throw new BridgeValidationError('Field "speech" harus berupa string');
       }
 
-      if (nextStatus === 'working' && agent.currentTaskId) {
-        const currentTask = this.store.getTask(agent.currentTaskId);
-        if (currentTask && currentTask.status === 'assigned') {
+      if (clientEventId) this.store.recordBridgeEventId(agentId, clientEventId);
+
+      const bridgeConnected = nextStatus === 'offline' ? false : true;
+      if (nextZone) {
+        this.store.updateAgent(agentId, { bridgeConnected });
+        this.store.moveAgentToZone(agentId, nextZone, 0, nextStatus);
+      } else if (nextStatus) {
+        this.store.updateAgent(agentId, { status: nextStatus, bridgeConnected });
+      } else {
+        this.store.updateAgent(agentId, { bridgeConnected });
+      }
+
+      const activeTaskId =
+        typeof payload.taskId === 'string' && payload.taskId.trim()
+          ? payload.taskId.trim()
+          : agent.currentTaskId;
+      if (nextStatus === 'working' && activeTaskId) {
+        const currentTask = this.store.getTask(activeTaskId);
+        if (currentTask && currentTask.assignedToId === agentId && currentTask.status === 'assigned') {
           this.store.updateTask(currentTask.id, { status: 'working' });
         }
       }
@@ -509,6 +641,7 @@ export class ExternalBridge {
       if (!parsedZone) {
         throw new BridgeValidationError('Field "zone" wajib diisi dengan ID zona yang valid');
       }
+      if (clientEventId) this.store.recordBridgeEventId(agentId, clientEventId);
       this.store.moveAgentToZone(agentId, parsedZone, 0);
       return { ok: true };
     }
@@ -518,12 +651,25 @@ export class ExternalBridge {
       if (!text) {
         throw new BridgeValidationError('Field "text" wajib diisi untuk event bot:speech');
       }
+      const rawToId =
+        typeof payload.toId === 'string'
+          ? payload.toId.trim()
+          : typeof payload.toAgentId === 'string'
+            ? payload.toAgentId.trim()
+            : 'all';
+      const recipient =
+        rawToId !== 'all' && rawToId !== 'user' ? this.store.getAgent(rawToId) : undefined;
+      const resolvedToId = rawToId === 'user' ? 'user' : recipient?.id || 'all';
+      const resolvedToName =
+        rawToId === 'user' ? 'Commander (Owner)' : recipient?.name || 'All Muse Bots';
+
+      if (clientEventId) this.store.recordBridgeEventId(agentId, clientEventId);
       this.store.setSpeechBubble(agentId, text, 'chat');
       this.store.addComms({
         fromId: agent.id,
         fromName: agent.name,
-        toId: 'all',
-        toName: 'All Muse Bots',
+        toId: resolvedToId,
+        toName: resolvedToName,
         kind: 'chat',
         content: text,
       });
@@ -540,6 +686,7 @@ export class ExternalBridge {
       if (toAgentId !== 'all' && !recipient) {
         throw new BridgeValidationError(`Bot penerima "${toAgentId}" tidak ditemukan`, 404);
       }
+      if (clientEventId) this.store.recordBridgeEventId(agentId, clientEventId);
       this.store.setSpeechBubble(agentId, content, 'chat');
       if (recipient) {
         this.store.emitBeam(agentId, recipient.id, content, agent.color);
@@ -566,6 +713,7 @@ export class ExternalBridge {
       if (!task || task.assignedToId !== agentId) {
         throw new BridgeValidationError('Tugas tidak ditemukan atau bukan milik bot ini', 404);
       }
+      if (clientEventId) this.store.recordBridgeEventId(agentId, clientEventId);
       if (task.status === 'completed' || task.status === 'failed') {
         return { ok: true, duplicate: true };
       }
@@ -574,12 +722,21 @@ export class ExternalBridge {
       return { ok: true };
     }
 
-    if (event === 'task:delegate' && this.handlers) {
-      const toAgentId = typeof payload.toAgentId === 'string' ? payload.toAgentId.trim() : '';
+    if ((event === 'bot:delegate' || event === 'task:delegate') && this.handlers) {
+      const toAgentId =
+        typeof payload.toAgentId === 'string' && payload.toAgentId.trim()
+          ? payload.toAgentId.trim()
+          : typeof payload.toId === 'string'
+            ? payload.toId.trim()
+            : '';
       const instructions = typeof payload.instructions === 'string' ? payload.instructions.trim() : '';
       if (!toAgentId || !instructions) {
         throw new BridgeValidationError('Field "toAgentId" dan "instructions" wajib diisi');
       }
+      if (!this.store.getAgent(toAgentId)) {
+        throw new BridgeValidationError(`Bot target "${toAgentId}" tidak ditemukan`, 404);
+      }
+      if (clientEventId) this.store.recordBridgeEventId(agentId, clientEventId);
       const created = await this.handlers.onExternalDelegation({
         fromAgentId: agentId,
         toAgentId,
@@ -606,6 +763,17 @@ export class ExternalBridge {
       if (!taskId) {
         throw new BridgeValidationError('Field "taskId" wajib diisi untuk task:complete');
       }
+      if (payload.result !== undefined && typeof payload.result !== 'string') {
+        throw new BridgeValidationError('Field "result" harus berupa string');
+      }
+      if (payload.speech !== undefined && typeof payload.speech !== 'string') {
+        throw new BridgeValidationError('Field "speech" harus berupa string');
+      }
+      const existingTask = this.store.getTask(taskId);
+      if (!existingTask || existingTask.assignedToId !== agentId) {
+        throw new BridgeValidationError('Tugas tidak ditemukan atau bukan milik bot ini', 404);
+      }
+      if (clientEventId) this.store.recordBridgeEventId(agentId, clientEventId);
       const result =
         typeof payload.result === 'string' && payload.result.trim()
           ? payload.result
@@ -626,6 +794,14 @@ export class ExternalBridge {
       if (!taskId) {
         throw new BridgeValidationError('Field "taskId" wajib diisi untuk task:fail');
       }
+      if (payload.error !== undefined && typeof payload.error !== 'string') {
+        throw new BridgeValidationError('Field "error" harus berupa string');
+      }
+      const existingTask = this.store.getTask(taskId);
+      if (!existingTask || existingTask.assignedToId !== agentId) {
+        throw new BridgeValidationError('Tugas tidak ditemukan atau bukan milik bot ini', 404);
+      }
+      if (clientEventId) this.store.recordBridgeEventId(agentId, clientEventId);
       const error =
         typeof payload.error === 'string' && payload.error.trim()
           ? payload.error

@@ -185,13 +185,16 @@ function drawPixelBot(
     Math.hypot(agent.targetPosition.x - renderState.x, agent.targetPosition.y - renderState.y) > 0.1;
   const isWorking = agent.status === 'working';
   const isThinking = agent.status === 'thinking';
+  const isTalking = agent.status === 'talking';
   const isOffline = agent.status === 'offline';
 
   const bob = isWalking
     ? Math.abs(Math.sin(renderState.walkPhase * 8)) * 4
     : isWorking
       ? Math.sin(t * 10) * 1
-      : Math.sin(t * 2.5 + sx * 0.05) * 1.2;
+      : isTalking
+        ? Math.abs(Math.sin(t * 8)) * 1.6
+        : Math.sin(t * 2.5 + sx * 0.05) * 1.2;
 
   ctx.save();
   if (isOffline) ctx.globalAlpha = 0.52;
@@ -258,10 +261,21 @@ function drawPixelBot(
     ctx.fillRect(sx - 5, baseY - 25, 3, 1);
     ctx.fillRect(sx + 2, baseY - 25, 3, 1);
   } else {
-    ctx.fillStyle = isWorking ? '#34d399' : isThinking ? '#fbbf24' : '#38bdf8';
+    ctx.fillStyle = isWorking
+      ? '#34d399'
+      : isThinking
+        ? '#fbbf24'
+        : isTalking
+          ? '#22d3ee'
+          : '#38bdf8';
     const lookX = isThinking ? Math.round(Math.sin(t * 4)) : 0;
     ctx.fillRect(sx - 5 + lookX, baseY - 27, 3, 3);
     ctx.fillRect(sx + 2 + lookX, baseY - 27, 3, 3);
+    if (isTalking) {
+      const mouthW = Math.floor(t * 9) % 2 === 0 ? 6 : 3;
+      ctx.fillStyle = '#67e8f9';
+      ctx.fillRect(sx - mouthW / 2, baseY - 23, mouthW, 1.5);
+    }
   }
 
   // Role Accessory
@@ -291,7 +305,7 @@ function drawPixelBot(
     ctx.fillRect(sx - 2, baseY - 39, 4, 2);
   }
 
-  // Working / Thinking overhead icon
+  // Working / Thinking / Talking overhead icon
   if (isWorking) {
     ctx.fillStyle = '#10b981';
     ctx.font = 'bold 10px "JetBrains Mono", monospace';
@@ -306,6 +320,12 @@ function drawPixelBot(
       ctx.fillRect(sx - 6 + i * 5, baseY - 46, 3, 3);
     }
     ctx.globalAlpha = 1;
+  } else if (isTalking) {
+    ctx.fillStyle = '#22d3ee';
+    for (let i = 0; i < 3; i++) {
+      const barH = 3 + Math.round(Math.abs(Math.sin(t * 10 + i * 1.3)) * 5);
+      ctx.fillRect(sx - 5 + i * 4, baseY - 42 - barH, 2.5, barH);
+    }
   }
 
   // Nameplate Pill
@@ -330,11 +350,13 @@ function drawPixelBot(
       ? '#10b981'
       : agent.status === 'online'
         ? '#22c55e'
-        : agent.status === 'thinking' || agent.status === 'meeting'
-          ? '#fbbf24'
-          : agent.status === 'offline' || agent.status === 'error'
-            ? '#ef4444'
-            : '#38bdf8';
+        : agent.status === 'talking'
+          ? '#06b6d4'
+          : agent.status === 'thinking' || agent.status === 'meeting'
+            ? '#fbbf24'
+            : agent.status === 'offline' || agent.status === 'error'
+              ? '#ef4444'
+              : '#38bdf8';
   ctx.fillStyle = statusColor;
   ctx.beginPath();
   ctx.arc(pillX + 7, pillY + 8, 2.7, 0, Math.PI * 2);
@@ -742,19 +764,43 @@ export const OfficeCanvas: React.FC<OfficeCanvasProps> = ({
         });
       }
 
-      // Update & queue bots for depth sorting
+      // Update & queue bots for depth sorting (with anti-stacking offset if spots collide)
       const currentBotCoords = new Map<string, { sx: number; sy: number }>();
+      const activeIds = new Set(activeAgents.map((a) => a.id));
+      for (const cachedId of renderPositions.current.keys()) {
+        if (!activeIds.has(cachedId)) renderPositions.current.delete(cachedId);
+      }
+      const claimedDest: Array<{ x: number; y: number }> = [];
 
       for (const agent of activeAgents) {
-        const dest = agent.status === 'walking' ? agent.targetPosition : agent.position;
+        const rawDest =
+          agent.status === 'walking'
+            ? agent.targetPosition || agent.position
+            : agent.position || agent.targetPosition;
+        const baseDest = rawDest || { x: 10, y: 7 };
+        let destX = baseDest.x;
+        let destY = baseDest.y;
+
+        let collisionCount = 0;
+        while (
+          claimedDest.some((p) => Math.hypot(p.x - destX, p.y - destY) < 0.25) &&
+          collisionCount < 8
+        ) {
+          collisionCount += 1;
+          const angle = collisionCount * 1.1;
+          destX = baseDest.x + Math.cos(angle) * 0.45;
+          destY = baseDest.y + Math.sin(angle) * 0.35;
+        }
+        claimedDest.push({ x: destX, y: destY });
+
         let state = renderPositions.current.get(agent.id);
         if (!state) {
-          state = { x: dest.x, y: dest.y, facing: 1, walkPhase: 0 };
+          state = { x: destX, y: destY, facing: 1, walkPhase: 0 };
           renderPositions.current.set(agent.id, state);
         }
 
-        const dx = dest.x - state.x;
-        const dy = dest.y - state.y;
+        const dx = destX - state.x;
+        const dy = destY - state.y;
         const dist = Math.hypot(dx, dy);
         if (dist > 0.04) {
           const step = Math.min(dist, dt * 4.5);
@@ -763,8 +809,8 @@ export const OfficeCanvas: React.FC<OfficeCanvasProps> = ({
           state.walkPhase += dt * 1.4;
           state.facing = dx >= dy ? 1 : -1;
         } else {
-          state.x = dest.x;
-          state.y = dest.y;
+          state.x = destX;
+          state.y = destY;
         }
 
         const screenPt = isoToScreen(state.x, state.y);
@@ -794,8 +840,10 @@ export const OfficeCanvas: React.FC<OfficeCanvasProps> = ({
       }
 
       // 6. Command Beams (Bot-to-Bot animated arcs)
+      const realNow = Date.now();
       const activeBeams = beamsRef.current;
       for (const beam of activeBeams) {
+        if (beam.expiresAt <= realNow) continue;
         const fromPt = currentBotCoords.get(beam.fromAgentId);
         const toPt = currentBotCoords.get(beam.toAgentId);
         if (!fromPt || !toPt) continue;
@@ -819,7 +867,8 @@ export const OfficeCanvas: React.FC<OfficeCanvasProps> = ({
         ctx.setLineDash([]);
 
         // Traveling glowing packet orb along quadratic curve
-        const prog = ((now - beam.createdAt) % 1200) / 1200;
+        const elapsed = Math.max(0, realNow - beam.createdAt);
+        const prog = (elapsed % 1200) / 1200;
         const u = 1 - prog;
         const orbX = u * u * startX + 2 * u * prog * ctrlX + prog * prog * endX;
         const orbY = u * u * startY + 2 * u * prog * ctrlY + prog * prog * endY;
@@ -853,7 +902,6 @@ export const OfficeCanvas: React.FC<OfficeCanvasProps> = ({
       }
 
       // 7. Speech Bubbles on top
-      const realNow = Date.now();
       for (const agent of activeAgents) {
         if (!agent.speechBubble || agent.speechBubble.expiresAt <= realNow) continue;
         const pt = currentBotCoords.get(agent.id);
@@ -993,6 +1041,8 @@ export const OfficeCanvas: React.FC<OfficeCanvasProps> = ({
         onPointerUp={handlePointerUp}
         onPointerLeave={() => {
           dragRef.current.dragging = false;
+          hoveredAgentRef.current = null;
+          hoveredZoneRef.current = null;
         }}
         onDoubleClick={handleDoubleClick}
         onWheel={handleWheel}

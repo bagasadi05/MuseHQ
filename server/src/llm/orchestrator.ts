@@ -213,7 +213,7 @@ export class MissionOrchestrator {
     if (!fromAgent || !toAgent) return null;
 
     let missionId = params.missionId;
-    if (!missionId) {
+    if (!missionId || !this.store.getMission(missionId)) {
       const m = this.store.addMission({
         id: `mission-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
         prompt: `[Bot Delegation] ${params.title}`,
@@ -416,7 +416,7 @@ export class MissionOrchestrator {
 
     if (agent) {
       this.store.updateAgent(agent.id, {
-        currentTaskId: null,
+        ...(agent.currentTaskId === taskId ? { currentTaskId: null } : {}),
         status: agent.type === 'external-rest' ? 'online' : 'idle',
       });
       this.store.setSpeechBubble(agent.id, speech || 'Tugas eksternal selesai!', 'report', 6000);
@@ -458,7 +458,10 @@ export class MissionOrchestrator {
     const agent = this.store.getAgent(task.assignedToId);
     this.store.updateTask(taskId, { status: 'failed', error });
     if (agent) {
-      this.store.updateAgent(agent.id, { currentTaskId: null, status: 'error' });
+      this.store.updateAgent(agent.id, {
+        ...(agent.currentTaskId === taskId ? { currentTaskId: null } : {}),
+        status: 'error',
+      });
       this.store.setSpeechBubble(agent.id, 'Tugas gagal!', 'error', 5000);
       this.store.addComms({
         missionId: task.missionId,
@@ -485,7 +488,7 @@ export class MissionOrchestrator {
     if (tasks.length === 0) return;
 
     const stillActive = tasks.some((t) =>
-      ['queued', 'waiting-dependency', 'assigned', 'working', 'delegated'].includes(t.status)
+      ['queued', 'waiting-dependency', 'assigned', 'working', 'in-progress', 'delegated'].includes(t.status)
     );
     if (stillActive) return;
 

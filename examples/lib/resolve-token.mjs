@@ -13,13 +13,19 @@ const RETIRED_TOKEN_HASHES = new Set([
 
 const RETIRED_PLACEHOLDERS = new Set([
   'your-secret-token',
+  'your-token-here',
+  'changeme',
   '<token-rahasia>',
   '<BOT_BRIDGE_TOKEN>',
 ]);
 
 function isUsableToken(token) {
-  if (!token || RETIRED_PLACEHOLDERS.has(token)) return false;
-  const hash = crypto.createHash('sha256').update(token, 'utf8').digest('hex');
+  if (!token) return false;
+  const trimmed = token.trim();
+  if (trimmed.length < 8) return false;
+  if (trimmed.startsWith('<') && trimmed.endsWith('>')) return false;
+  if (RETIRED_PLACEHOLDERS.has(trimmed) || trimmed.includes('ganti-dengan')) return false;
+  const hash = crypto.createHash('sha256').update(trimmed, 'utf8').digest('hex');
   return !RETIRED_TOKEN_HASHES.has(hash);
 }
 
@@ -49,7 +55,12 @@ function parseEnvFile(filePath, key) {
 function isLocalTarget(targetUrl) {
   try {
     const parsed = new URL(targetUrl);
-    return parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
+    return (
+      parsed.hostname === 'localhost' ||
+      parsed.hostname === '127.0.0.1' ||
+      parsed.hostname === '::1' ||
+      parsed.hostname === '[::1]'
+    );
   } catch {
     return false;
   }

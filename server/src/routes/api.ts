@@ -1,5 +1,10 @@
 import { NextFunction, Request, Response, Router } from 'express';
-import { BridgeValidationError, ExternalBridge } from '../bridge/externalBridge.js';
+import {
+  BridgeValidationError,
+  ExternalBridge,
+  normalizeAgentStatus,
+  validateWebhookUrl,
+} from '../bridge/externalBridge.js';
 import { MissionOrchestrator } from '../llm/orchestrator.js';
 import { normalizeZoneId, pickSpotInZone } from '../officeMap.js';
 import {
@@ -87,7 +92,7 @@ export function createApiRouter(
   });
 
   router.post('/auth/login', noStore, (req, res) => {
-    const { passcode } = (req.body || {}) as { passcode?: string };
+    const { passcode } = (req.body || {}) as { passcode?: unknown };
     const configured = store.getSettings().ownerPasscode;
     if (!configured) {
       res.status(503).json({
@@ -95,7 +100,7 @@ export function createApiRouter(
       });
       return;
     }
-    if (!passcode || !timingSafeEqualStr(passcode.trim(), configured)) {
+    if (typeof passcode !== 'string' || !passcode.trim() || !timingSafeEqualStr(passcode.trim(), configured)) {
       res.status(401).json({ error: 'Owner passcode salah.' });
       return;
     }
@@ -120,8 +125,8 @@ export function createApiRouter(
   // --- Owner Mission & Agent Management Routes ---
   router.post('/missions', requireOwner, async (req, res) => {
     try {
-      const { prompt, targetAgentId, stream, clientContext } = req.body as {
-        prompt?: string;
+      const { prompt, targetAgentId, stream, clientContext } = (req.body || {}) as {
+        prompt?: unknown;
         targetAgentId?: string;
         stream?: boolean;
         clientContext?: {
@@ -129,7 +134,7 @@ export function createApiRouter(
           settingsPatch?: Partial<RuntimeSettings>;
         };
       };
-      if (!prompt || !prompt.trim()) {
+      if (typeof prompt !== 'string' || !prompt.trim()) {
         res.status(400).json({ error: 'Prompt perintah tidak boleh kosong.' });
         return;
       }
@@ -147,20 +152,31 @@ export function createApiRouter(
         res.flushHeaders?.();
 
         const unsubscribe = store.subscribe((event, payload) => {
-          res.write(`data: ${JSON.stringify({ event, payload })}\n\n`);
+          if (!res.writableEnded) {
+            res.write(`data: ${JSON.stringify({ event, payload })}\n\n`);
+          }
         });
+        req.on('close', unsubscribe);
 
         try {
-          await orchestrator.startMission(prompt, targetAgentId, true);
-          res.write(`data: ${JSON.stringify({ event: 'done', payload: store.getSnapshot() })}\n\n`);
+          await orchestrator.startMission(prompt, typeof targetAgentId === 'string' ? targetAgentId : undefined, true);
+          if (!res.writableEnded) {
+            res.write(`data: ${JSON.stringify({ event: 'done', payload: store.getSnapshot() })}\n\n`);
+          }
         } finally {
           unsubscribe();
-          res.end();
+          if (!res.writableEnded) {
+            res.end();
+          }
         }
         return;
       }
 
-      const mission = await orchestrator.startMission(prompt, targetAgentId, IS_SERVERLESS);
+      const mission = await orchestrator.startMission(
+        prompt,
+        typeof targetAgentId === 'string' ? targetAgentId : undefined,
+        IS_SERVERLESS
+      );
       res.status(201).json({ mission });
     } catch (err) {
       if (!res.headersSent) {
@@ -182,8 +198,8 @@ export function createApiRouter(
   });
 
   router.post('/agents', requireOwner, (req, res) => {
-    const body = req.body as Partial<Agent> & { name?: string; role?: string };
-    if (!body.name?.trim() || !body.role?.trim()) {
+    const body = (req.body || {}) as Partial<Agent> & { name?: unknown; role?: unknown };
+    if (typeof body.name !== 'string' || !body.name.trim() || typeof body.role !== 'string' || !body.role.trim()) {
       res.status(400).json({ error: 'Nama dan role bot wajib diisi.' });
       return;
     }
@@ -198,11 +214,38 @@ export function createApiRouter(
       zone = normalized;
     }
 
+    let webhookUrl: string | undefined;
+    try {
+      webhookUrl = validateWebhookUrl(body.webhookUrl);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'webhookUrl tidak valid' });
+      return;
+    }
+
+    const validProviders: LLMProvider[] = ['demo', 'gemini', 'openai', 'anthropic'];
+    if (body.provider !== undefined && !validProviders.includes(body.provider)) {
+      res.status(400).json({ error: `Provider tidak valid: ${String(body.provider)}` });
+      return;
+    }
+
+    const validTypes: AgentType[] = ['builtin', 'external-ws', 'external-rest', 'external-webhook'];
+    if (body.type !== undefined && !validTypes.includes(body.type)) {
+      res.status(400).json({ error: `Tipe bot tidak valid: ${String(body.type)}` });
+      return;
+    }
+
     const slugBase = body.name
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, '-')
       .replace(/(^-|-$)/g, '');
-    const id = body.id?.trim() || `muse-${slugBase || 'bot'}-${Date.now().toString(36).slice(-4)}`;
+    const id =
+      typeof body.id === 'string' && body.id.trim()
+        ? body.id.trim()
+        : `muse-${slugBase || 'bot'}-${Date.now().toString(36).slice(-4)}`;
+    if (!/^[a-z0-9][a-z0-9_-]{1,63}$/i.test(id)) {
+      res.status(400).json({ error: 'ID bot tidak valid (2-64 karakter alfanumerik, - atau _)' });
+      return;
+    }
     const pos = pickSpotInZone(zone, store.getAgents().length, store.getOccupiedInZone(zone));
     const type: AgentType = body.type || 'builtin';
     const provider: LLMProvider = body.provider || store.getSettings().defaultProvider;
@@ -213,14 +256,18 @@ export function createApiRouter(
       id,
       name: body.name.trim(),
       role: body.role.trim(),
-      description: body.description?.trim() || `Bot spesialis ${body.role.trim()}`,
+      description:
+        typeof body.description === 'string' && body.description.trim()
+          ? body.description.trim()
+          : `Bot spesialis ${body.role.trim()}`,
       systemPrompt:
-        body.systemPrompt?.trim() ||
-        `Kamu adalah ${body.name.trim()}, berperan sebagai ${body.role.trim()}. Kerjakan tugas dengan teliti dan terstruktur.`,
+        typeof body.systemPrompt === 'string' && body.systemPrompt.trim()
+          ? body.systemPrompt.trim()
+          : `Kamu adalah ${body.name.trim()}, berperan sebagai ${body.role.trim()}. Kerjakan tugas dengan teliti dan terstruktur.`,
       type,
       provider,
-      model: body.model?.trim() || '',
-      webhookUrl: body.webhookUrl?.trim() || undefined,
+      model: typeof body.model === 'string' ? body.model.trim() : '',
+      webhookUrl,
       bridgeConnected: type !== 'external-ws',
       canDelegate: Boolean(body.canDelegate),
       homeZone: zone,
@@ -259,25 +306,52 @@ export function createApiRouter(
       res.status(404).json({ error: 'Bot tidak ditemukan' });
       return;
     }
-    const patch = req.body as Partial<Agent>;
+    const patch = (req.body || {}) as Partial<Agent>;
     const allowed: Partial<Agent> = {};
     const fields: Array<keyof Agent> = [
       'name',
       'role',
       'description',
       'systemPrompt',
-      'type',
-      'provider',
       'model',
-      'webhookUrl',
       'canDelegate',
       'color',
       'avatarVariant',
-      'status',
     ];
     for (const key of fields) {
       if (patch[key] !== undefined) {
         (allowed as Record<string, unknown>)[key] = patch[key];
+      }
+    }
+
+    if (patch.provider !== undefined) {
+      if (!['demo', 'gemini', 'openai', 'anthropic'].includes(patch.provider)) {
+        res.status(400).json({ error: `Provider tidak valid: ${String(patch.provider)}` });
+        return;
+      }
+      allowed.provider = patch.provider;
+    }
+    if (patch.type !== undefined) {
+      if (!['builtin', 'external-ws', 'external-rest', 'external-webhook'].includes(patch.type)) {
+        res.status(400).json({ error: `Tipe bot tidak valid: ${String(patch.type)}` });
+        return;
+      }
+      allowed.type = patch.type;
+    }
+    if (patch.status !== undefined) {
+      const normalizedStatus = normalizeAgentStatus(patch.status);
+      if (!normalizedStatus) {
+        res.status(400).json({ error: `Status tidak valid: ${String(patch.status)}` });
+        return;
+      }
+      allowed.status = normalizedStatus;
+    }
+    if (patch.webhookUrl !== undefined) {
+      try {
+        allowed.webhookUrl = validateWebhookUrl(patch.webhookUrl);
+      } catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'webhookUrl tidak valid' });
+        return;
       }
     }
 
@@ -340,7 +414,7 @@ export function createApiRouter(
       res.status(404).json({ error: 'Bot pengirim tidak ditemukan' });
       return;
     }
-    if (!content?.trim()) {
+    if (typeof content !== 'string' || !content.trim()) {
       res.status(400).json({ error: 'Pesan tidak boleh kosong' });
       return;
     }
@@ -401,7 +475,11 @@ export function createApiRouter(
 
   router.post('/settings', noStore, requireOwner, (req, res) => {
     try {
-      const updated = store.updateSettings(req.body || {});
+      if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+        res.status(400).json({ error: 'Payload pengaturan harus berupa objek JSON' });
+        return;
+      }
+      const updated = store.updateSettings(req.body);
       res.json({ settings: updated, snapshot: store.getSnapshot() });
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : 'Pengaturan tidak valid' });
@@ -416,7 +494,8 @@ export function createApiRouter(
   });
 
   router.get('/bridge/bots/:id/events', noStore, requireBridgeToken, (req, res) => {
-    const since = Number(req.query.since || 0) || 0;
+    const parsedSince = Number(req.query.since);
+    const since = Number.isFinite(parsedSince) && parsedSince >= 0 ? parsedSince : 0;
     const agent = store.getAgent(req.params.id);
     if (!agent) {
       res.status(404).json({ error: `Bot "${req.params.id}" tidak ditemukan` });
@@ -433,30 +512,35 @@ export function createApiRouter(
 
   router.post('/bridge/register', noStore, requireBridgeToken, (req, res) => {
     try {
-      const body = req.body as {
-        id?: string;
-        name?: string;
-        role?: string;
-        description?: string;
+      const body = (req.body || {}) as {
+        id?: unknown;
+        name?: unknown;
+        role?: unknown;
+        description?: unknown;
         homeZone?: ZoneId;
-        color?: string;
-        canDelegate?: boolean;
-        webhookUrl?: string;
+        color?: unknown;
+        canDelegate?: unknown;
+        webhookUrl?: unknown;
       };
-      if (!body.name?.trim()) {
-        res.status(400).json({ error: 'name wajib diisi' });
+      if (typeof body.name !== 'string' || !body.name.trim()) {
+        res.status(400).json({ error: 'name wajib diisi berupa string' });
         return;
       }
+      if (body.id !== undefined && typeof body.id !== 'string') {
+        res.status(400).json({ error: 'id harus berupa string' });
+        return;
+      }
+      const webhookUrl = validateWebhookUrl(body.webhookUrl);
       const agent = bridge.registerOrUpdateExternalBot({
-        id: body.id,
+        id: typeof body.id === 'string' ? body.id : undefined,
         name: body.name.trim(),
-        role: body.role?.trim() || 'External Bot',
-        description: body.description,
+        role: typeof body.role === 'string' && body.role.trim() ? body.role.trim() : 'External Bot',
+        description: typeof body.description === 'string' ? body.description : undefined,
         homeZone: body.homeZone,
-        color: body.color,
-        canDelegate: body.canDelegate,
-        type: body.webhookUrl ? 'external-webhook' : 'external-rest',
-        webhookUrl: body.webhookUrl,
+        color: typeof body.color === 'string' ? body.color : undefined,
+        canDelegate: body.canDelegate !== undefined ? Boolean(body.canDelegate) : undefined,
+        type: webhookUrl ? 'external-webhook' : 'external-rest',
+        webhookUrl,
       });
       res.status(201).json({ agent, snapshot: store.getSnapshot() });
     } catch (err) {
@@ -474,8 +558,20 @@ export function createApiRouter(
       };
       if (typeof body.event !== 'string' || !body.event.trim()) {
         res.status(400).json({
-          error: 'event wajib diisi (misal: bot:hello, bot:status, bot:speech, bot:message, task:delegate, task:complete)',
+          error:
+            'event wajib diisi (misal: bot:hello, bot:heartbeat, bot:status, bot:speech, bot:delegate, task:accept, task:complete, task:fail)',
         });
+        return;
+      }
+      if (
+        body.payload !== undefined &&
+        (body.payload === null || typeof body.payload !== 'object' || Array.isArray(body.payload))
+      ) {
+        res.status(400).json({ error: 'payload wajib berupa objek JSON' });
+        return;
+      }
+      if (body.eventId !== undefined && typeof body.eventId !== 'string') {
+        res.status(400).json({ error: 'eventId wajib berupa string' });
         return;
       }
       const payload =
@@ -494,11 +590,19 @@ export function createApiRouter(
   });
 
   router.post('/bridge/tasks/:id/complete', noStore, requireBridgeToken, async (req, res) => {
-    const { result, speech } = req.body as { result?: string; speech?: string };
+    const { result, speech } = (req.body || {}) as { result?: unknown; speech?: unknown };
+    if (result !== undefined && typeof result !== 'string') {
+      res.status(400).json({ error: 'result harus berupa string' });
+      return;
+    }
+    if (speech !== undefined && typeof speech !== 'string') {
+      res.status(400).json({ error: 'speech harus berupa string' });
+      return;
+    }
     const outcome = await orchestrator.completeExternalTask(
       req.params.id,
-      result || 'Selesai dikerjakan oleh bot eksternal.',
-      speech
+      (typeof result === 'string' && result.trim()) ? result : 'Selesai dikerjakan oleh bot eksternal.',
+      typeof speech === 'string' ? speech : undefined
     );
     if (!outcome.applied) {
       res.status(404).json({ error: outcome.reason || 'Tugas tidak ditemukan' });
@@ -508,16 +612,24 @@ export function createApiRouter(
   });
 
   router.post('/bridge/tasks/:id/fail', noStore, requireBridgeToken, async (req, res) => {
-    const { error } = req.body as { error?: string };
+    const { error } = (req.body || {}) as { error?: unknown };
+    if (error !== undefined && typeof error !== 'string') {
+      res.status(400).json({ error: 'error harus berupa string' });
+      return;
+    }
     const outcome = await orchestrator.failExternalTask(
       req.params.id,
-      error || 'External task failed'
+      (typeof error === 'string' && error.trim()) ? error : 'External task failed'
     );
     if (!outcome.applied) {
       res.status(404).json({ error: outcome.reason || 'Tugas tidak ditemukan' });
       return;
     }
     res.json({ ok: true, duplicate: Boolean(outcome.duplicate) });
+  });
+
+  router.use((_req, res) => {
+    res.status(404).json({ error: 'API endpoint not found' });
   });
 
   return router;

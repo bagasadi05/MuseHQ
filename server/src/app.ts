@@ -1,4 +1,4 @@
-import 'dotenv/config';
+import './env.js';
 import cors from 'cors';
 import express, { Express, NextFunction, Request, Response } from 'express';
 import { ExternalBridge } from './bridge/externalBridge.js';
@@ -57,6 +57,14 @@ export function createMuseApp(): MuseAppContext {
   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
     if (err.message.startsWith('Origin not allowed by CORS')) {
       res.status(403).json({ error: err.message });
+      return;
+    }
+    if (
+      err instanceof SyntaxError &&
+      'status' in err &&
+      (err as { status?: number }).status === 400
+    ) {
+      res.status(400).json({ error: 'Invalid JSON body' });
       return;
     }
     res.status(500).json({ error: 'Internal server error' });

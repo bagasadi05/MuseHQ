@@ -1,3 +1,4 @@
+import './env.js';
 import express from 'express';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -40,7 +41,14 @@ server.on('upgrade', (request, socket, head) => {
     return;
   }
 
-  const url = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`);
+  let url: URL;
+  try {
+    url = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`);
+  } catch {
+    socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+    socket.destroy();
+    return;
+  }
   if (url.pathname === '/ws/ui') {
     const cookies = parseCookies(request.headers.cookie);
     const sessionOk = verifySessionToken(
@@ -88,3 +96,12 @@ server.listen(PORT, () => {
     );
   }
 });
+
+function handleShutdown() {
+  store.flushPersist();
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 1000).unref();
+}
+
+process.on('SIGINT', handleShutdown);
+process.on('SIGTERM', handleShutdown);

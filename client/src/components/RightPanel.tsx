@@ -2,10 +2,12 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   Activity,
   Bot,
+  Check,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
   Clock,
+  Copy,
   FileText,
   ListChecks,
   MessageSquare,
@@ -24,6 +26,7 @@ import {
   ZONES_META,
   ZoneId,
 } from '../types';
+import { MarkdownView } from './MarkdownView';
 
 interface RightPanelProps {
   agents: Agent[];
@@ -47,7 +50,7 @@ interface RightPanelProps {
   onResetWorkspace: () => Promise<void>;
 }
 
-type TabId = 'comms' | 'tasks' | 'inspector';
+type TabId = 'comms' | 'tasks' | 'deliverables' | 'inspector';
 
 const STATUS_BADGES: Record<string, { label: string; cls: string }> = {
   queued: { label: 'Antre', cls: 'bg-slate-700/70 text-slate-300' },
@@ -58,6 +61,7 @@ const STATUS_BADGES: Record<string, { label: string; cls: string }> = {
   assigned: { label: 'Ditugaskan', cls: 'bg-sky-500/20 text-sky-300' },
   delegated: { label: 'Menunggu Bot Luar', cls: 'bg-purple-500/20 text-purple-300' },
   working: { label: 'Dikerjakan', cls: 'bg-amber-500/20 text-amber-300' },
+  'in-progress': { label: 'Dikerjakan', cls: 'bg-amber-500/20 text-amber-300' },
   completed: { label: 'Selesai', cls: 'bg-emerald-500/20 text-emerald-300' },
   failed: { label: 'Gagal', cls: 'bg-rose-500/20 text-rose-300' },
 };
@@ -80,12 +84,14 @@ export const RightPanel: React.FC<RightPanelProps> = ({
   const [tab, setTab] = useState<TabId>('comms');
   const [expandedTaskId, setExpandedTaskId] = useState<string | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
+  const [copiedDeliverableId, setCopiedDeliverableId] = useState<string | null>(null);
 
   // Bot-to-bot manual relay state
   const [relayFrom, setRelayFrom] = useState('muse-lead');
   const [relayTo, setRelayTo] = useState('muse-dev');
   const [relayText, setRelayText] = useState('');
   const [relayAsTask, setRelayAsTask] = useState(true);
+  const [relaySending, setRelaySending] = useState(false);
 
   const commsEndRef = useRef<HTMLDivElement>(null);
 
@@ -110,18 +116,36 @@ export const RightPanel: React.FC<RightPanelProps> = ({
 
   const latestMission = missions[missions.length - 1];
   const selectedAgent = agents.find((a) => a.id === selectedAgentId) || agents[0] || null;
+  const missionDeliverables = [...missions].reverse().filter((m) => Boolean(m.finalSummary));
+  const taskDeliverables = [...tasks]
+    .reverse()
+    .filter((t) => t.status === 'completed' && Boolean(t.result));
+  const deliverablesCount = missionDeliverables.length + taskDeliverables.length;
+
+  const handleCopyMarkdown = (id: string, markdown: string) => {
+    navigator.clipboard.writeText(markdown);
+    setCopiedDeliverableId(id);
+    setTimeout(() => setCopiedDeliverableId(null), 1600);
+  };
 
   const handleRelaySubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!relayText.trim() || !relayFrom || !relayTo) return;
-    await onSendBotCommand(
-      relayFrom,
-      relayTo,
-      relayText.trim(),
-      relayAsTask,
-      relayAsTask ? `Order langsung` : undefined
-    );
-    setRelayText('');
+    if (!relayText.trim() || !relayFrom || !relayTo || relaySending) return;
+    setRelaySending(true);
+    try {
+      await onSendBotCommand(
+        relayFrom,
+        relayTo,
+        relayText.trim(),
+        relayAsTask,
+        relayAsTask ? `Order langsung` : undefined
+      );
+      setRelayText('');
+    } catch {
+      // Errors surface via socket auth guard or server comms log
+    } finally {
+      setRelaySending(false);
+    }
   };
 
   return (
@@ -201,11 +225,13 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                 ? 'bg-emerald-400 animate-pulse'
                 : a.status === 'online'
                   ? 'bg-green-400'
-                  : a.status === 'thinking' || a.status === 'meeting'
-                    ? 'bg-amber-400'
-                    : a.status === 'offline' || a.status === 'error'
-                      ? 'bg-rose-500'
-                      : 'bg-sky-400';
+                  : a.status === 'talking'
+                    ? 'bg-cyan-400 animate-pulse'
+                    : a.status === 'thinking' || a.status === 'meeting'
+                      ? 'bg-amber-400'
+                      : a.status === 'offline' || a.status === 'error'
+                        ? 'bg-rose-500'
+                        : 'bg-sky-400';
             return (
               <button
                 key={a.id}
@@ -228,17 +254,17 @@ export const RightPanel: React.FC<RightPanelProps> = ({
       </div>
 
       {/* Navigation Tabs */}
-      <div className="flex items-center border-b border-slate-800 px-2 pt-2">
+      <div className="flex items-center border-b border-slate-800 px-1.5 pt-2">
         <button
           type="button"
           onClick={() => setTab('comms')}
-          className={`flex flex-1 items-center justify-center gap-1.5 border-b-2 px-3 py-2 text-xs font-semibold transition cursor-pointer ${
+          className={`flex flex-1 items-center justify-center gap-1 border-b-2 px-2 py-2 text-xs font-semibold transition cursor-pointer ${
             tab === 'comms'
               ? 'border-amber-400 text-amber-300'
               : 'border-transparent text-slate-400 hover:text-slate-200'
           }`}
         >
-          <MessageSquare className="h-3.5 w-3.5" />
+          <MessageSquare className="h-3.5 w-3.5 shrink-0" />
           <span>Comms</span>
           <span className="rounded-full bg-slate-800 px-1.5 py-0.5 text-[10px] text-slate-400">
             {comms.length}
@@ -248,13 +274,13 @@ export const RightPanel: React.FC<RightPanelProps> = ({
         <button
           type="button"
           onClick={() => setTab('tasks')}
-          className={`flex flex-1 items-center justify-center gap-1.5 border-b-2 px-3 py-2 text-xs font-semibold transition cursor-pointer ${
+          className={`flex flex-1 items-center justify-center gap-1 border-b-2 px-2 py-2 text-xs font-semibold transition cursor-pointer ${
             tab === 'tasks'
               ? 'border-amber-400 text-amber-300'
               : 'border-transparent text-slate-400 hover:text-slate-200'
           }`}
         >
-          <ListChecks className="h-3.5 w-3.5" />
+          <ListChecks className="h-3.5 w-3.5 shrink-0" />
           <span>Tugas</span>
           <span className="rounded-full bg-slate-800 px-1.5 py-0.5 text-[10px] text-slate-400">
             {tasks.length}
@@ -263,15 +289,31 @@ export const RightPanel: React.FC<RightPanelProps> = ({
 
         <button
           type="button"
+          onClick={() => setTab('deliverables')}
+          className={`flex flex-1 items-center justify-center gap-1 border-b-2 px-2 py-2 text-xs font-semibold transition cursor-pointer ${
+            tab === 'deliverables'
+              ? 'border-amber-400 text-amber-300'
+              : 'border-transparent text-slate-400 hover:text-slate-200'
+          }`}
+        >
+          <FileText className="h-3.5 w-3.5 shrink-0" />
+          <span>Hasil</span>
+          <span className="rounded-full bg-slate-800 px-1.5 py-0.5 text-[10px] text-slate-400">
+            {deliverablesCount}
+          </span>
+        </button>
+
+        <button
+          type="button"
           onClick={() => setTab('inspector')}
-          className={`flex flex-1 items-center justify-center gap-1.5 border-b-2 px-3 py-2 text-xs font-semibold transition cursor-pointer ${
+          className={`flex flex-1 items-center justify-center gap-1 border-b-2 px-2 py-2 text-xs font-semibold transition cursor-pointer ${
             tab === 'inspector'
               ? 'border-amber-400 text-amber-300'
               : 'border-transparent text-slate-400 hover:text-slate-200'
           }`}
         >
-          <Settings2 className="h-3.5 w-3.5" />
-          <span>Inspeksi Bot</span>
+          <Settings2 className="h-3.5 w-3.5 shrink-0" />
+          <span>Bot</span>
         </button>
       </div>
 
@@ -331,7 +373,58 @@ export const RightPanel: React.FC<RightPanelProps> = ({
         )}
 
         {tab === 'tasks' && (
-          <div className="flex flex-col gap-2">
+          <div className="flex flex-col gap-2.5">
+            {missions.length > 0 && (
+              <div className="space-y-1.5">
+                <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+                  Misi ({missions.length})
+                </div>
+                {[...missions]
+                  .reverse()
+                  .slice(0, 5)
+                  .map((m) => (
+                    <div
+                      key={m.id}
+                      className="flex items-center justify-between gap-2 rounded-xl border border-slate-800/90 bg-slate-950/60 px-2.5 py-2 text-xs"
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-1.5">
+                          <span
+                            className={`rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase ${
+                              m.status === 'running'
+                                ? 'bg-amber-500/20 text-amber-300'
+                                : m.status === 'completed'
+                                  ? 'bg-emerald-500/20 text-emerald-300'
+                                  : 'bg-rose-500/20 text-rose-300'
+                            }`}
+                          >
+                            {m.status === 'running'
+                              ? 'Berjalan'
+                              : m.status === 'completed'
+                                ? 'Selesai'
+                                : 'Gagal'}
+                          </span>
+                          <span className="truncate text-[11px] text-slate-200">{m.prompt}</span>
+                        </div>
+                      </div>
+                      {m.finalSummary && (
+                        <button
+                          type="button"
+                          onClick={() => onOpenReport(m)}
+                          className="shrink-0 rounded-md border border-emerald-500/35 bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-200 hover:bg-emerald-500/25 cursor-pointer"
+                        >
+                          Laporan
+                        </button>
+                      )}
+                    </div>
+                  ))}
+              </div>
+            )}
+
+            <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+              Sub-Tugas & Dependensi ({tasks.length})
+            </div>
+
             {tasks.length === 0 ? (
               <div className="rounded-xl border border-dashed border-slate-800 p-6 text-center text-xs text-slate-400">
                 Belum ada sub-tugas. Kirim perintah di Command Bar bawah untuk melihat bot saling
@@ -343,6 +436,12 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                 const assigner = agents.find((a) => a.id === task.assignedById);
                 const st = STATUS_BADGES[task.status] || STATUS_BADGES.queued;
                 const open = expandedTaskId === task.id;
+                const depTasks = task.dependsOnTaskIds
+                  .map((depId) => tasks.find((t) => t.id === depId))
+                  .filter((t): t is Task => Boolean(t));
+                const pendingDeps = depTasks.filter(
+                  (t) => t.status !== 'completed' && t.status !== 'failed'
+                ).length;
 
                 return (
                   <div
@@ -375,8 +474,16 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                             {assignee?.name || task.assignedToId}
                           </span>
                           {task.dependsOnTaskIds.length > 0 && (
-                            <span className="rounded bg-slate-800 px-1.5 py-0.5 text-[10px] text-slate-400">
-                              Menunggu {task.dependsOnTaskIds.length} tugas
+                            <span
+                              className={`rounded px-1.5 py-0.5 text-[10px] ${
+                                task.status === 'waiting-dependency'
+                                  ? 'bg-violet-500/15 text-violet-300'
+                                  : 'bg-slate-800 text-slate-400'
+                              }`}
+                            >
+                              {task.status === 'waiting-dependency'
+                                ? `Menunggu ${pendingDeps || task.dependsOnTaskIds.length} dependensi`
+                                : `Setelah ${task.dependsOnTaskIds.length} tugas`}
                             </span>
                           )}
                         </div>
@@ -390,6 +497,30 @@ export const RightPanel: React.FC<RightPanelProps> = ({
 
                     {open && (
                       <div className="border-t border-slate-800/80 px-3 py-2.5 text-xs">
+                        {task.dependsOnTaskIds.length > 0 && (
+                          <div className="mb-2.5 rounded-lg border border-slate-800 bg-slate-900/70 p-2">
+                            <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+                              Dependensi ({task.dependsOnTaskIds.length})
+                            </div>
+                            <div className="flex flex-wrap gap-1">
+                              {task.dependsOnTaskIds.map((depId) => {
+                                const dep = tasks.find((t) => t.id === depId);
+                                const depBadge = dep
+                                  ? STATUS_BADGES[dep.status] || STATUS_BADGES.queued
+                                  : STATUS_BADGES.queued;
+                                return (
+                                  <span
+                                    key={depId}
+                                    className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] ${depBadge.cls}`}
+                                  >
+                                    <span>{dep?.title || depId}</span>
+                                    <span className="opacity-75">({depBadge.label})</span>
+                                  </span>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        )}
                         <div className="mb-2 text-[11px] font-medium text-slate-400">Instruksi:</div>
                         <p className="mb-3 whitespace-pre-wrap rounded-lg bg-slate-900 p-2 text-slate-300">
                           {task.instructions}
@@ -400,8 +531,8 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                               <CheckCircle2 className="h-3.5 w-3.5" />
                               <span>Hasil Pekerjaan:</span>
                             </div>
-                            <div className="whitespace-pre-wrap rounded-lg border border-emerald-500/20 bg-emerald-950/20 p-2.5 leading-relaxed text-slate-200">
-                              {task.result}
+                            <div className="rounded-lg border border-emerald-500/20 bg-emerald-950/20 p-2.5 text-slate-200">
+                              <MarkdownView content={task.result} />
                             </div>
                           </>
                         )}
@@ -414,7 +545,15 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                         {!task.result && !task.error && (
                           <div className="flex items-center gap-1.5 text-[11px] text-slate-400">
                             <Clock className="h-3.5 w-3.5" />
-                            <span>Sedang diproses di workstation {assignee?.name}...</span>
+                            <span>
+                              {task.status === 'waiting-dependency'
+                                ? 'Menunggu tugas pendahulu selesai sebelum dieksekusi...'
+                                : task.status === 'queued'
+                                  ? 'Dalam antrean eksekusi...'
+                                  : task.status === 'assigned' || task.status === 'delegated'
+                                    ? `Tugas dikirim ke ${assignee?.name || task.assignedToId}, menunggu pengerjaan...`
+                                    : `Sedang diproses di workstation ${assignee?.name || task.assignedToId}...`}
+                            </span>
                           </div>
                         )}
                       </div>
@@ -422,6 +561,107 @@ export const RightPanel: React.FC<RightPanelProps> = ({
                   </div>
                 );
               })
+            )}
+          </div>
+        )}
+
+        {tab === 'deliverables' && (
+          <div className="flex flex-col gap-3">
+            <div className="text-[11px] font-medium text-slate-400">
+              Deliverables Markdown ({deliverablesCount})
+            </div>
+
+            {deliverablesCount === 0 ? (
+              <div className="rounded-xl border border-dashed border-slate-800 p-6 text-center text-xs text-slate-400">
+                Belum ada deliverable Markdown. Hasil pekerjaan bot dan laporan akhir misi akan
+                tampil di sini secara otomatis.
+              </div>
+            ) : (
+              <>
+                {missionDeliverables.map((m) => (
+                  <div
+                    key={m.id}
+                    className="rounded-xl border border-emerald-500/30 bg-slate-950/80 p-3"
+                  >
+                    <div className="mb-2 flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="text-[10px] font-semibold uppercase tracking-wider text-emerald-400">
+                          Laporan Akhir Misi
+                        </div>
+                        <div className="line-clamp-2 text-xs font-semibold text-slate-100">
+                          {m.prompt}
+                        </div>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() => handleCopyMarkdown(m.id, m.finalSummary || '')}
+                          className="rounded border border-slate-700 bg-slate-800 p-1 text-slate-300 hover:bg-slate-700 cursor-pointer"
+                          title="Salin Markdown"
+                        >
+                          {copiedDeliverableId === m.id ? (
+                            <Check className="h-3 w-3 text-emerald-400" />
+                          ) : (
+                            <Copy className="h-3 w-3" />
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => onOpenReport(m)}
+                          className="rounded border border-emerald-500/40 bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-200 hover:bg-emerald-500/25 cursor-pointer"
+                        >
+                          Perbesar
+                        </button>
+                      </div>
+                    </div>
+                    <div className="max-h-60 overflow-y-auto rounded-lg border border-slate-800/80 bg-slate-900/60 p-2.5">
+                      <MarkdownView content={m.finalSummary || ''} />
+                    </div>
+                  </div>
+                ))}
+
+                {taskDeliverables.map((task) => {
+                  const assignee = agents.find((a) => a.id === task.assignedToId);
+                  return (
+                    <div
+                      key={task.id}
+                      className="rounded-xl border border-slate-800 bg-slate-950/75 p-3"
+                    >
+                      <div className="mb-2 flex items-start justify-between gap-2">
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-1.5">
+                            <span
+                              className="h-2 w-2 rounded-full"
+                              style={{ backgroundColor: assignee?.color || '#38bdf8' }}
+                            />
+                            <span className="text-[10px] font-semibold text-slate-400">
+                              {assignee?.name || task.assignedToId}
+                            </span>
+                          </div>
+                          <div className="truncate text-xs font-semibold text-slate-100">
+                            {task.title}
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => handleCopyMarkdown(task.id, task.result || '')}
+                          className="shrink-0 rounded border border-slate-700 bg-slate-800 p-1 text-slate-300 hover:bg-slate-700 cursor-pointer"
+                          title="Salin Markdown"
+                        >
+                          {copiedDeliverableId === task.id ? (
+                            <Check className="h-3 w-3 text-emerald-400" />
+                          ) : (
+                            <Copy className="h-3 w-3" />
+                          )}
+                        </button>
+                      </div>
+                      <div className="max-h-56 overflow-y-auto rounded-lg border border-slate-800/80 bg-slate-900/50 p-2.5">
+                        <MarkdownView content={task.result || ''} />
+                      </div>
+                    </div>
+                  );
+                })}
+              </>
             )}
           </div>
         )}
@@ -491,7 +731,7 @@ export const RightPanel: React.FC<RightPanelProps> = ({
             />
             <button
               type="submit"
-              disabled={!relayText.trim()}
+              disabled={!relayText.trim() || relaySending}
               className="rounded-lg bg-slate-800 p-1.5 text-amber-300 transition hover:bg-slate-700 disabled:opacity-40 cursor-pointer"
               title="Kirim antar bot"
             >

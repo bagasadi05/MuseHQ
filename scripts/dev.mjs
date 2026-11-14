@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -44,9 +44,25 @@ console.log('Starting MuseHQ Server & Virtual Office Client...');
 const server = launch('SERVER', ['--prefix', 'server', 'run', 'dev'], '36');
 const client = launch('CLIENT', ['--prefix', 'client', 'run', 'dev'], '35');
 
+let shuttingDown = false;
+
+function killTree(child) {
+  if (!child || child.exitCode !== null || child.killed || !child.pid) return;
+  if (isWin) {
+    spawnSync('taskkill', ['/pid', String(child.pid), '/t', '/f'], {
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+  } else {
+    child.kill('SIGTERM');
+  }
+}
+
 function shutdown() {
-  server.kill();
-  client.kill();
+  if (shuttingDown) return;
+  shuttingDown = true;
+  killTree(server);
+  killTree(client);
   process.exit(0);
 }
 

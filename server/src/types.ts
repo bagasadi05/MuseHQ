@@ -13,6 +13,7 @@ export type AgentStatus =
   | 'walking'
   | 'thinking'
   | 'working'
+  | 'talking'
   | 'meeting'
   | 'offline'
   | 'error';
@@ -71,6 +72,7 @@ export type TaskStatus =
   | 'assigned'
   | 'delegated'
   | 'working'
+  | 'in-progress'
   | 'completed'
   | 'failed';
 

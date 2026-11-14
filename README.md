@@ -19,7 +19,7 @@ Di dalam MuseHQ, Anda (Commander / Pemilik) memberi misi lewat Command Bar, lalu
    - Menghubungkan bot nyata dari proses/mesin terpisah ke dalam ruangan yang sama melalui dua protokol:
      - **WebSocket Bridge (`/ws/bot?token=<BOT_BRIDGE_TOKEN>`)** — koneksi *full-duplex* dua arah secara *real-time*.
      - **REST Bridge & Polling (`/api/bridge/bots/:id/event`, `/api/bridge/bots/:id/events?since=`, `GET /api/state?since=`)** — aman untuk lingkungan serverless (seperti Vercel) atau skrip Python/Node/n8n/cron dengan deduplikasi berbasis `cursor` & `eventId`.
-   - Mendukung event tervalidasi: `bot:hello`, `bot:heartbeat`, `bot:status`, `bot:speech`, `bot:delegate`, `task:accept`, `task:complete`, `task:fail`, serta event keluar `task:assigned`, `comms:message`, `ping`.
+   - Mendukung event tervalidasi: `bot:hello`, `bot:heartbeat`, `bot:status`, `bot:move`, `bot:speech`, `bot:message`, `bot:delegate` (alias `task:delegate`), `task:accept`, `task:complete`, `task:fail`, serta event keluar `bot:registered`, `task:assigned`, `comms:message`, `ping`, `error`.
 
 3. **2D Isometric Virtual Office UI (`client/src/components/OfficeCanvas.tsx`)**
    - Menampilkan denah kantor 2D isometric dengan **7 zona kanonik**:
@@ -83,7 +83,7 @@ npm run example:bot
 ```bash
 npm run example:rest-bot
 ```
-`Muse REST Worker` (`muse-rest-worker`) mendaftar via `POST /api/bridge/bots/muse-rest-worker/event`, membaca `GET /api/state?since=<cursor>`, dan melaporkan hasil tanpa duplikasi saat polling diulang.
+`Muse REST Worker` (`muse-rest-worker`, zona default `qa-bench`, interval `POLL_MS=2500` min `1000`) mendaftar via `POST /api/bridge/bots/muse-rest-worker/event`, membaca `GET /api/state?since=<cursor>`, mengirim `bot:heartbeat` tiap siklus, dan melaporkan hasil tanpa duplikasi saat polling diulang. Jika menargetkan preview Vercel yang diproteksi Deployment Protection, tambahkan `VERCEL_BYPASS_SECRET` (dikirim via header `x-vercel-protection-bypass`).
 
 ### 3. Menghubungkan 4 Agen Rekan Nyata Sekaligus
 Keempat ID agen berikut diperlakukan sebagai **rekan setara** oleh `Muse Lead` (tidak dibatasi kuota delegasi):
@@ -107,7 +107,7 @@ BOT_ID=muse-bagas BOT_NAME="Muse Bagas" BOT_HOME_ZONE=command-desk BOT_BRIDGE_TO
 | `BOT_BRIDGE_TOKEN` | *(auto-random di lokal)* | Token rahasia untuk `/ws/bot` dan `/api/bridge/*` + `GET /api/state` bot |
 | `MUSE_OWNER_PASSCODE` | *(auto-random di lokal)* | Passcode pemilik untuk membuka UI web (`/api/auth/login`) |
 | `SESSION_SECRET` | *(auto-random / derivatif)* | Kunci penandatanganan cookie HMAC `muse_session` |
-| `ALLOWED_ORIGINS` | `localhost:5173,localhost:3001` | Daftar origin CORS yang diizinkan (pisahkan koma) |
+| `ALLOWED_ORIGINS` | `http://localhost:5173,http://localhost:3001` | Daftar origin CORS yang diizinkan (pisahkan koma, sertakan skema `http://` atau `https://`) |
 | `DEFAULT_PROVIDER` | `demo` | Provider default: `demo`, `gemini`, `openai`, atau `anthropic` |
 | `GEMINI_API_KEY` | — | API Key Google Gemini |
 | `GEMINI_MODEL` | `gemini-2.5-flash` | Model Gemini yang dipakai |
@@ -142,12 +142,17 @@ Cocok untuk **VPS (Ubuntu + Nginx/Caddy TLS), Railway, Render, atau Fly.io**:
    - `ALLOWED_ORIGINS=https://domain-anda.com`
 3. Jalankan `npm start` (server melayani API, `/ws/ui`, `/ws/bot`, dan static bundle `client/dist`). State tersimpan persisten di disk (`server/data/state.json`).
 
-### Opsi B — Vercel Serverless + REST Bridge (`vercel.json` & `api/index.mjs`)
+### Opsi B — Vercel Serverless + REST Polling (`vercel.json` & `api/index.mjs`)
 Cocok untuk deployment cepat tanpa manage VPS:
-1. Import repository ke Vercel (`buildCommand: npm run build`, `outputDirectory: client/dist`).
-2. Wajib atur Environment Variables di Vercel (**Production & Preview**):
-   - `BOT_BRIDGE_TOKEN` (sensitif)
-   - `MUSE_OWNER_PASSCODE` (sensitif)
-   - `SESSION_SECRET` (sensitif — menjaga cookie sesi owner tetap valid lintas *cold start*)
-3. Di Vercel Serverless (tanpa WebSocket stateful jangka panjang), UI otomatis berjalan pada mode **Cloud Sync (SSE Streaming)** dan bot eksternal terhubung lewat **REST Polling** (`GET /api/state?since=` & `POST /api/bridge/bots/:id/event`).
-   - *Catatan Serverless:* Memori fungsi Lambda/Serverless bersifat sementara saat idle; gunakan Opsi A (Node persisten) jika Anda membutuhkan bot WebSocket tersambung terus-menerus dan persistensi file lokal tanpa database eksternal.
+1. Import repository ke Vercel (`buildCommand: npm run build`, `outputDirectory: client/dist`, fungsi `api/index.mjs` dengan `maxDuration: 60` dan `includeFiles: server/dist/**`).
+2. Wajib atur Environment Variables di Vercel (**Production & Preview**, tandai sebagai **`Sensitive`**):
+   - `BOT_BRIDGE_TOKEN` (`sensitive`)
+   - `MUSE_OWNER_PASSCODE` (`sensitive`)
+   - `SESSION_SECRET` (`sensitive` — menjaga cookie sesi owner `muse_session` tetap valid lintas *cold start*)
+   - *(Opsional)* `ALLOWED_ORIGINS`, `DEFAULT_PROVIDER`, serta `GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` (tandai `sensitive`) jika memakai Cloud LLM.
+3. Di Vercel Serverless (tanpa WebSocket stateful jangka panjang), UI otomatis berjalan pada mode **Cloud Sync (SSE Streaming)** dan bot eksternal terhubung lewat **REST Polling** (`GET /api/state?since=<cursor>` & `POST /api/bridge/bots/:id/event`):
+   ```bash
+   MUSE_BASE_URL="https://domain-vercel-anda.vercel.app" BOT_BRIDGE_TOKEN="<TOKEN>" npm run example:rest-bot
+   ```
+   *(Opsional: tambahkan `VERCEL_BYPASS_SECRET="<BYPASS_TOKEN>"` untuk preview Vercel yang dilindungi Vercel Protection).*
+   - *Catatan Serverless:* Memori fungsi Lambda/Serverless dan `/tmp` bersifat sementara (*ephemeral*) saat idle/*cold start*; gunakan **Opsi A (Node persisten)** jika Anda membutuhkan bot WebSocket `/ws/bot` tersambung terus-menerus dan persistensi file lokal (`server/data/state.json`) tanpa database eksternal.

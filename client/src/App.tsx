@@ -86,11 +86,13 @@ export default function App() {
     }
   };
 
-  const handleLaunchMission = async (prompt: string, targetId: string) => {
+  const handleLaunchMission = async (prompt: string, targetId: string): Promise<boolean> => {
     try {
       await launchMission(prompt, targetId);
+      return true;
     } catch (err) {
       showError(err instanceof Error ? err.message : 'Gagal mengirim perintah');
+      return false;
     }
   };
 
@@ -387,6 +389,9 @@ SESSION_SECRET=<string-acak-32-karakter>`}
           await updateSettings(patch);
         }}
         onApplyProviderToAll={handleApplyProviderToAll}
+        onUpdateBotProvider={async (agentId, provider) => {
+          await updateAgent(agentId, { provider });
+        }}
       />
 
       <ReportModal mission={reportMission} onClose={() => setReportMission(null)} />

@@ -66,6 +66,7 @@ async function callCloudText(
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(45_000),
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: systemPrompt }] },
         contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
@@ -90,6 +91,7 @@ async function callCloudText(
         'Content-Type': 'application/json',
         Authorization: `Bearer ${apiKey}`,
       },
+      signal: AbortSignal.timeout(45_000),
       body: JSON.stringify({
         model,
         temperature: jsonMode ? 0.3 : 0.6,
@@ -117,6 +119,7 @@ async function callCloudText(
       'x-api-key': apiKey,
       'anthropic-version': '2023-06-01',
     },
+    signal: AbortSignal.timeout(45_000),
     body: JSON.stringify({
       model,
       max_tokens: 2048,
@@ -134,10 +137,13 @@ async function callCloudText(
 }
 
 function extractJsonObject<T>(raw: string): T | null {
+  const cleaned = raw.trim();
+  const fenced = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = fenced ? fenced[1].trim() : cleaned;
   try {
-    return JSON.parse(raw) as T;
+    return JSON.parse(candidate) as T;
   } catch {
-    const match = raw.match(/\{[\s\S]*\}/);
+    const match = candidate.match(/\{[\s\S]*\}/);
     if (!match) return null;
     try {
       return JSON.parse(match[0]) as T;
@@ -338,8 +344,25 @@ Gunakan bahasa yang sama dengan prompt user.`;
     );
     const parsed = extractJsonObject<LeadPlanResult>(raw);
     if (parsed && Array.isArray(parsed.delegations)) {
-      const validIds = new Set(roster.filter((a) => a.id !== lead.id).map((a) => a.id));
-      const cleanDelegations = parsed.delegations.filter((d) => validIds.has(d.toAgentId));
+      const validIds = new Set(
+        roster.filter((a) => a.id !== lead.id && a.status !== 'offline').map((a) => a.id)
+      );
+      const indexMap = new Map<number, number>();
+      const kept: DelegationProposal[] = [];
+      parsed.delegations.forEach((d, oldIdx) => {
+        if (d && typeof d.toAgentId === 'string' && validIds.has(d.toAgentId)) {
+          indexMap.set(oldIdx, kept.length);
+          kept.push(d);
+        }
+      });
+      const cleanDelegations = kept.map((d, newIdx) => ({
+        ...d,
+        dependsOnIndex: Array.isArray(d.dependsOnIndex)
+          ? d.dependsOnIndex
+              .map((oldDep) => indexMap.get(oldDep))
+              .filter((mapped): mapped is number => mapped !== undefined && mapped !== newIdx)
+          : [],
+      }));
       return {
         thought: parsed.thought || 'Rencana tugas disusun.',
         speech: parsed.speech || 'Membagikan tugas ke tim sekarang!',

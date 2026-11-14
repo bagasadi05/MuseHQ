@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Check, Copy, FileText, X } from 'lucide-react';
 import { Mission } from '../types';
+import { MarkdownView } from './MarkdownView';
 
 interface ReportModalProps {
   mission: Mission | null;
@@ -61,8 +62,8 @@ export const ReportModal: React.FC<ReportModalProps> = ({ mission, onClose }) =>
             <span className="font-semibold text-amber-300">Perintah Awal: </span>
             {mission.prompt}
           </div>
-          <div className="whitespace-pre-wrap rounded-xl border border-slate-800 bg-slate-950/70 p-4 text-xs leading-relaxed text-slate-200">
-            {mission.finalSummary || 'Belum ada ringkasan akhir.'}
+          <div className="rounded-xl border border-slate-800 bg-slate-950/70 p-4 text-xs leading-relaxed text-slate-200">
+            <MarkdownView content={mission.finalSummary || 'Belum ada ringkasan akhir.'} />
           </div>
         </div>
       </div>

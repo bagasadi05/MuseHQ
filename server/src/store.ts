@@ -152,7 +152,7 @@ function createDefaultAgents(defaultProvider: RuntimeSettings['defaultProvider']
 
 function maskKey(key: string): string {
   if (!key) return '';
-  if (key.length <= 8) return '••••••••';
+  if (key.length < 16) return '••••••••';
   return `${key.slice(0, 4)}••••${key.slice(-4)}`;
 }
 
@@ -235,7 +235,7 @@ export class WorkspaceStore {
     settings: RuntimeSettings;
     securityStatus: StartupSecurityStatus;
   } {
-    const envProvider = (process.env.DEFAULT_PROVIDER || 'demo') as RuntimeSettings['defaultProvider'];
+    const envProvider = (process.env.DEFAULT_PROVIDER || '').trim().toLowerCase() as RuntimeSettings['defaultProvider'];
     const rawEnvBridge = (process.env.BOT_BRIDGE_TOKEN || '').trim();
     const envBridgeValid = !isRetiredToken(rawEnvBridge) ? rawEnvBridge : '';
     const envOwnerPasscode = (process.env.MUSE_OWNER_PASSCODE || '').trim();
@@ -332,6 +332,7 @@ export class WorkspaceStore {
           const isExternalWs = agent.type === 'external-ws';
           const isRest = agent.type === 'external-rest';
           const fallbackPos = pickSpotInZone(homeZone, idx, occupied);
+          const sameZonePos = agent.currentZone === homeZone ? agent.position : undefined;
           occupied.push(fallbackPos);
           return {
             ...agent,
@@ -342,8 +343,8 @@ export class WorkspaceStore {
             speechBubble: null,
             currentZone: homeZone,
             targetZone: homeZone,
-            position: agent.position ?? fallbackPos,
-            targetPosition: agent.position ?? fallbackPos,
+            position: sameZonePos ?? fallbackPos,
+            targetPosition: sameZonePos ?? fallbackPos,
           };
         });
         this.missions = (parsed.missions || []).map((m) =>
@@ -351,6 +352,7 @@ export class WorkspaceStore {
         );
         this.tasks = (parsed.tasks || []).map((t) =>
           t.status === 'working' ||
+          t.status === 'in-progress' ||
           t.status === 'delegated' ||
           t.status === 'queued' ||
           t.status === 'waiting-dependency' ||
@@ -402,8 +404,17 @@ export class WorkspaceStore {
     }
     if (this.persistTimer) clearTimeout(this.persistTimer);
     this.persistTimer = setTimeout(() => {
+      this.persistTimer = null;
       this.writeStateToDisk();
     }, 150);
+  }
+
+  flushPersist(): void {
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = null;
+    }
+    this.writeStateToDisk();
   }
 
   getSettings(): RuntimeSettings {
@@ -578,6 +589,12 @@ export class WorkspaceStore {
     return queue.filter((e) => e.seq > sinceSeq);
   }
 
+  hasBridgeEventId(agentId: string, eventId: string): boolean {
+    if (!eventId) return false;
+    const list = this.processedBridgeEventIds.get(agentId);
+    return Boolean(list && list.includes(eventId));
+  }
+
   recordBridgeEventId(agentId: string, eventId: string): boolean {
     if (!eventId) return true;
     const list = this.processedBridgeEventIds.get(agentId) || [];
@@ -720,7 +737,11 @@ export class WorkspaceStore {
     const mission = this.missions.find((m) => m.id === id);
     if (!mission) return undefined;
     Object.assign(mission, patch);
-    this.schedulePersist();
+    if (patch.status === 'completed' || patch.status === 'failed') {
+      this.flushPersist();
+    } else {
+      this.schedulePersist();
+    }
     this.emit('mission:updated', mission);
     return mission;
   }
