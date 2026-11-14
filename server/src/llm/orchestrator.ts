@@ -15,7 +15,11 @@ export class MissionOrchestrator {
     private bridge: ExternalBridge
   ) {}
 
-  async startMission(prompt: string, targetAgentId = 'muse-lead'): Promise<Mission> {
+  async startMission(
+    prompt: string,
+    targetAgentId = 'muse-lead',
+    waitForCompletion = false
+  ): Promise<Mission> {
     const cleanPrompt = prompt.trim();
     const agents = this.store.getAgents();
     const target =
@@ -47,8 +51,12 @@ export class MissionOrchestrator {
       content: cleanPrompt,
     });
 
-    // Run asynchronously so HTTP request returns immediately while WebSocket streams live progress
-    void this.runCoordinatorFlow(mission, target);
+    if (waitForCompletion) {
+      await this.runCoordinatorFlow(mission, target);
+    } else {
+      // Run asynchronously so HTTP request returns immediately while WebSocket streams live progress
+      void this.runCoordinatorFlow(mission, target);
+    }
     return mission;
   }
 

@@ -23,6 +23,7 @@ import { LLMProvider, Mission } from './types';
 export default function App() {
   const {
     connected,
+    transportMode,
     agents,
     missions,
     tasks,
@@ -115,7 +116,9 @@ export default function App() {
               }`}
             >
               {connected ? <Wifi className="h-3 w-3" /> : <WifiOff className="h-3 w-3" />}
-              <span>{connected ? 'Live Sync' : 'Reconnecting'}</span>
+              <span>
+                {connected ? (transportMode === 'cloud' ? 'Cloud Sync' : 'Live Sync') : 'Reconnecting'}
+              </span>
             </span>
 
             <span className="flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-950 px-2.5 py-1 text-[11px] text-slate-300">

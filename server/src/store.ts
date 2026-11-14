@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pickSpotInZone } from './officeMap.js';
@@ -16,8 +17,14 @@ import {
   ZoneId,
 } from './types.js';
 
+export const IS_SERVERLESS = Boolean(
+  process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.NETLIFY
+);
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = path.resolve(__dirname, '..', 'data');
+const DATA_DIR = IS_SERVERLESS
+  ? path.join(os.tmpdir(), 'muse-hq-data')
+  : path.resolve(__dirname, '..', 'data');
 const STATE_FILE = path.join(DATA_DIR, 'state.json');
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 
@@ -144,16 +151,39 @@ export class WorkspaceStore {
   private beams: CommandBeam[] = [];
   private settings: RuntimeSettings;
   private broadcaster: BroadcastFn = () => {};
+  private subscribers = new Set<BroadcastFn>();
   private persistTimer: NodeJS.Timeout | null = null;
 
   constructor() {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    } catch {
+      // Ignore directory errors in strictly read-only environments
+    }
     this.settings = this.loadSettings();
     this.loadState();
   }
 
   setBroadcaster(fn: BroadcastFn): void {
     this.broadcaster = fn;
+  }
+
+  subscribe(fn: BroadcastFn): () => void {
+    this.subscribers.add(fn);
+    return () => {
+      this.subscribers.delete(fn);
+    };
+  }
+
+  private emit(event: string, payload: unknown): void {
+    this.broadcaster(event, payload);
+    for (const sub of this.subscribers) {
+      try {
+        sub(event, payload);
+      } catch {
+        // Ignore closed stream subscriber errors
+      }
+    }
   }
 
   private loadSettings(): RuntimeSettings {
@@ -243,20 +273,30 @@ export class WorkspaceStore {
     this.schedulePersist();
   }
 
-  private schedulePersist(): void {
-    if (this.persistTimer) clearTimeout(this.persistTimer);
-    this.persistTimer = setTimeout(() => {
-      try {
-        const payload: PersistedState = {
-          agents: this.agents,
-          missions: this.missions.slice(-50),
-          tasks: this.tasks.slice(-250),
-          comms: this.comms.slice(-200),
-        };
-        fs.writeFileSync(STATE_FILE, JSON.stringify(payload, null, 2), 'utf8');
-      } catch (err) {
+  private writeStateToDisk(): void {
+    try {
+      const payload: PersistedState = {
+        agents: this.agents,
+        missions: this.missions.slice(-50),
+        tasks: this.tasks.slice(-250),
+        comms: this.comms.slice(-200),
+      };
+      fs.writeFileSync(STATE_FILE, JSON.stringify(payload, null, 2), 'utf8');
+    } catch (err) {
+      if (!IS_SERVERLESS) {
         console.error('Failed to persist workspace state:', err);
       }
+    }
+  }
+
+  private schedulePersist(): void {
+    if (IS_SERVERLESS) {
+      this.writeStateToDisk();
+      return;
+    }
+    if (this.persistTimer) clearTimeout(this.persistTimer);
+    this.persistTimer = setTimeout(() => {
+      this.writeStateToDisk();
     }, 200);
   }
 
@@ -302,11 +342,60 @@ export class WorkspaceStore {
     }
 
     this.settings = { ...this.settings, ...cleanPatch };
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(this.settings, null, 2), 'utf8');
+    try {
+      fs.writeFileSync(SETTINGS_FILE, JSON.stringify(this.settings, null, 2), 'utf8');
+    } catch {
+      // Ignore write failures in ephemeral runtimes
+    }
 
     const publicSettings = this.getPublicSettings();
-    this.broadcaster('settings:updated', publicSettings);
+    this.emit('settings:updated', publicSettings);
     return publicSettings;
+  }
+
+  hydrateFromClient(clientContext?: {
+    agents?: Agent[];
+    settingsPatch?: Partial<RuntimeSettings>;
+  }): void {
+    if (!clientContext) return;
+    if (clientContext.settingsPatch) {
+      const p = clientContext.settingsPatch;
+      if (p.defaultProvider) this.settings.defaultProvider = p.defaultProvider;
+      if (p.geminiApiKey) this.settings.geminiApiKey = p.geminiApiKey;
+      if (p.openaiApiKey) this.settings.openaiApiKey = p.openaiApiKey;
+      if (p.anthropicApiKey) this.settings.anthropicApiKey = p.anthropicApiKey;
+      if (p.geminiModel) this.settings.geminiModel = p.geminiModel;
+      if (p.openaiModel) this.settings.openaiModel = p.openaiModel;
+      if (p.anthropicModel) this.settings.anthropicModel = p.anthropicModel;
+    }
+    if (Array.isArray(clientContext.agents) && clientContext.agents.length > 0) {
+      for (const incoming of clientContext.agents) {
+        if (!incoming?.id) continue;
+        const existing = this.getAgent(incoming.id);
+        if (existing) {
+          Object.assign(existing, {
+            name: incoming.name || existing.name,
+            role: incoming.role || existing.role,
+            description: incoming.description || existing.description,
+            systemPrompt: incoming.systemPrompt || existing.systemPrompt,
+            provider: incoming.provider || existing.provider,
+            model: incoming.model ?? existing.model,
+            homeZone: incoming.homeZone || existing.homeZone,
+            canDelegate: incoming.canDelegate ?? existing.canDelegate,
+            webhookUrl: incoming.webhookUrl ?? existing.webhookUrl,
+            color: incoming.color || existing.color,
+            avatarVariant: incoming.avatarVariant || existing.avatarVariant,
+          });
+        } else {
+          this.agents.push({
+            ...incoming,
+            status: incoming.type === 'external-ws' ? 'offline' : 'idle',
+            currentTaskId: null,
+            speechBubble: null,
+          });
+        }
+      }
+    }
   }
 
   getSnapshot(): WorkspaceSnapshot {
@@ -343,7 +432,7 @@ export class WorkspaceStore {
       this.agents.push(agent);
     }
     this.schedulePersist();
-    this.broadcaster('agent:updated', agent);
+    this.emit('agent:updated', agent);
     return agent;
   }
 
@@ -352,7 +441,7 @@ export class WorkspaceStore {
     if (!agent) return undefined;
     Object.assign(agent, patch, { lastSeenAt: new Date().toISOString() });
     this.schedulePersist();
-    this.broadcaster('agent:updated', agent);
+    this.emit('agent:updated', agent);
     return agent;
   }
 
@@ -361,7 +450,7 @@ export class WorkspaceStore {
     if (idx < 0) return false;
     this.agents.splice(idx, 1);
     this.schedulePersist();
-    this.broadcaster('agent:removed', { id });
+    this.emit('agent:removed', { id });
     return true;
   }
 
@@ -378,7 +467,7 @@ export class WorkspaceStore {
     if (sameSpot) {
       if (nextStatus) agent.status = nextStatus;
       agent.lastSeenAt = new Date().toISOString();
-      this.broadcaster('agent:updated', agent);
+      this.emit('agent:updated', agent);
       return agent;
     }
 
@@ -386,7 +475,18 @@ export class WorkspaceStore {
     agent.targetPosition = destination;
     agent.status = 'walking';
     agent.lastSeenAt = new Date().toISOString();
-    this.broadcaster('agent:updated', agent);
+    this.emit('agent:updated', agent);
+
+    if (IS_SERVERLESS) {
+      // Serverless functions cannot rely on deferred timers after response ends;
+      // client OfficeCanvas still smoothly interpolates the sprite along the floor.
+      agent.currentZone = zone;
+      agent.position = { ...destination };
+      agent.status = nextStatus ?? 'idle';
+      agent.lastSeenAt = new Date().toISOString();
+      this.emit('agent:updated', agent);
+      return agent;
+    }
 
     // Deterministic travel time so server state converges with smooth client A* walk
     setTimeout(() => {
@@ -399,7 +499,7 @@ export class WorkspaceStore {
       }
       current.lastSeenAt = new Date().toISOString();
       this.schedulePersist();
-      this.broadcaster('agent:updated', current);
+      this.emit('agent:updated', current);
     }, 1100);
 
     return agent;
@@ -419,7 +519,7 @@ export class WorkspaceStore {
       kind,
       expiresAt: Date.now() + durationMs,
     };
-    this.broadcaster('agent:updated', agent);
+    this.emit('agent:updated', agent);
   }
 
   emitBeam(fromAgentId: string, toAgentId: string, label: string, color = '#fbbf24'): void {
@@ -433,13 +533,13 @@ export class WorkspaceStore {
       expiresAt: Date.now() + 3600,
     };
     this.beams.push(beam);
-    this.broadcaster('beam:created', beam);
+    this.emit('beam:created', beam);
   }
 
   addMission(mission: Mission): Mission {
     this.missions.push(mission);
     this.schedulePersist();
-    this.broadcaster('mission:updated', mission);
+    this.emit('mission:updated', mission);
     return mission;
   }
 
@@ -448,7 +548,7 @@ export class WorkspaceStore {
     if (!mission) return undefined;
     Object.assign(mission, patch);
     this.schedulePersist();
-    this.broadcaster('mission:updated', mission);
+    this.emit('mission:updated', mission);
     return mission;
   }
 
@@ -459,7 +559,7 @@ export class WorkspaceStore {
   addTask(task: Task): Task {
     this.tasks.push(task);
     this.schedulePersist();
-    this.broadcaster('task:updated', task);
+    this.emit('task:updated', task);
     return task;
   }
 
@@ -468,7 +568,7 @@ export class WorkspaceStore {
     if (!task) return undefined;
     Object.assign(task, patch, { updatedAt: new Date().toISOString() });
     this.schedulePersist();
-    this.broadcaster('task:updated', task);
+    this.emit('task:updated', task);
     return task;
   }
 
@@ -491,7 +591,7 @@ export class WorkspaceStore {
       this.comms = this.comms.slice(-200);
     }
     this.schedulePersist();
-    this.broadcaster('comms:message', msg);
+    this.emit('comms:message', msg);
     return msg;
   }
 
@@ -517,6 +617,6 @@ export class WorkspaceStore {
       if (agent.status !== 'offline') agent.status = 'idle';
     }
     this.schedulePersist();
-    this.broadcaster('snapshot', this.getSnapshot());
+    this.emit('snapshot', this.getSnapshot());
   }
 }

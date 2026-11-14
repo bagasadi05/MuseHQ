@@ -1,41 +1,17 @@
-import 'dotenv/config';
-import cors from 'cors';
 import express from 'express';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
-import { ExternalBridge } from './bridge/externalBridge.js';
-import { MissionOrchestrator } from './llm/orchestrator.js';
-import { createApiRouter } from './routes/api.js';
-import { WorkspaceStore } from './store.js';
+import { createMuseApp } from './app.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3001);
 
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: '2mb' }));
+const { app, store, bridge } = createMuseApp();
 
-const store = new WorkspaceStore();
-const bridge = new ExternalBridge(store);
-const orchestrator = new MissionOrchestrator(store, bridge);
-
-store.setBroadcaster((event, payload) => {
-  bridge.broadcastToUi(event, payload);
-});
-
-bridge.setHandlers({
-  onExternalTaskCompleted: (taskId, result, speech) =>
-    orchestrator.completeExternalTask(taskId, result, speech),
-  onExternalTaskFailed: (taskId, error) => orchestrator.failExternalTask(taskId, error),
-  onExternalDelegation: (params) => orchestrator.delegateFromBot(params),
-});
-
-app.use('/api', createApiRouter(store, orchestrator, bridge));
-
-// Serve built client assets when running in production mode
+// Serve built client assets when running in standalone Node production mode
 const clientDist = path.resolve(__dirname, '..', '..', 'client', 'dist');
 if (fs.existsSync(clientDist)) {
   app.use(express.static(clientDist));

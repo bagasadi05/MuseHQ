@@ -2,8 +2,8 @@ import { NextFunction, Request, Response, Router } from 'express';
 import { ExternalBridge } from '../bridge/externalBridge.js';
 import { MissionOrchestrator } from '../llm/orchestrator.js';
 import { pickSpotInZone } from '../officeMap.js';
-import { WorkspaceStore } from '../store.js';
-import { Agent, AgentType, AvatarVariant, LLMProvider, ZoneId } from '../types.js';
+import { IS_SERVERLESS, WorkspaceStore } from '../store.js';
+import { Agent, AgentType, AvatarVariant, LLMProvider, RuntimeSettings, ZoneId } from '../types.js';
 
 export function createApiRouter(
   store: WorkspaceStore,
@@ -23,7 +23,12 @@ export function createApiRouter(
   };
 
   router.get('/health', (_req, res) => {
-    res.json({ ok: true, service: 'muse-hq-server', timestamp: new Date().toISOString() });
+    res.json({
+      ok: true,
+      service: 'muse-hq-server',
+      serverless: IS_SERVERLESS,
+      timestamp: new Date().toISOString(),
+    });
   });
 
   router.get('/state', (_req, res) => {
@@ -32,21 +37,60 @@ export function createApiRouter(
 
   router.post('/missions', async (req, res) => {
     try {
-      const { prompt, targetAgentId } = req.body as { prompt?: string; targetAgentId?: string };
+      const { prompt, targetAgentId, stream, clientContext } = req.body as {
+        prompt?: string;
+        targetAgentId?: string;
+        stream?: boolean;
+        clientContext?: {
+          agents?: Agent[];
+          settingsPatch?: Partial<RuntimeSettings>;
+        };
+      };
       if (!prompt || !prompt.trim()) {
         res.status(400).json({ error: 'Prompt perintah tidak boleh kosong.' });
         return;
       }
-      const mission = await orchestrator.startMission(prompt, targetAgentId);
+
+      if (clientContext) {
+        store.hydrateFromClient(clientContext);
+      }
+
+      const shouldStream = Boolean(stream || req.headers.accept?.includes('text/event-stream'));
+      if (shouldStream) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache, no-transform');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.flushHeaders?.();
+
+        const unsubscribe = store.subscribe((event, payload) => {
+          res.write(`data: ${JSON.stringify({ event, payload })}\n\n`);
+        });
+
+        try {
+          await orchestrator.startMission(prompt, targetAgentId, true);
+          res.write(`data: ${JSON.stringify({ event: 'done', payload: store.getSnapshot() })}\n\n`);
+        } finally {
+          unsubscribe();
+          res.end();
+        }
+        return;
+      }
+
+      const mission = await orchestrator.startMission(prompt, targetAgentId, IS_SERVERLESS);
       res.status(201).json({ mission });
     } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : 'Gagal memulai misi' });
+      if (!res.headersSent) {
+        res.status(500).json({ error: err instanceof Error ? err.message : 'Gagal memulai misi' });
+      } else {
+        res.end();
+      }
     }
   });
 
   router.post('/missions/clear', (_req, res) => {
     store.clearHistory();
-    res.json({ ok: true });
+    res.json({ ok: true, snapshot: store.getSnapshot() });
   });
 
   router.post('/agents', (req, res) => {
@@ -109,7 +153,7 @@ export function createApiRouter(
       content: `${agent.name} (${agent.role}) bergabung ke ruangan kerja di zona ${zone}.`,
     });
 
-    res.status(201).json({ agent });
+    res.status(201).json({ agent, snapshot: store.getSnapshot() });
   });
 
   router.patch('/agents/:id', (req, res) => {
@@ -145,7 +189,7 @@ export function createApiRouter(
     if (patch.homeZone && patch.homeZone !== existing.currentZone) {
       store.moveAgentToZone(req.params.id, patch.homeZone, 0, updated?.status);
     }
-    res.json({ agent: updated });
+    res.json({ agent: updated, snapshot: store.getSnapshot() });
   });
 
   router.delete('/agents/:id', (req, res) => {
@@ -154,7 +198,7 @@ export function createApiRouter(
       res.status(404).json({ error: 'Bot tidak ditemukan' });
       return;
     }
-    res.json({ ok: true });
+    res.json({ ok: true, snapshot: store.getSnapshot() });
   });
 
   router.post('/agents/:id/move', (req, res) => {
@@ -168,21 +212,28 @@ export function createApiRouter(
       res.status(404).json({ error: 'Bot tidak ditemukan' });
       return;
     }
-    res.json({ agent });
+    res.json({ agent, snapshot: store.getSnapshot() });
   });
 
   router.post('/agents/:id/chat', async (req, res) => {
+    const { toAgentId, content, createTask, title, clientContext } = req.body as {
+      toAgentId?: string;
+      content?: string;
+      createTask?: boolean;
+      title?: string;
+      clientContext?: {
+        agents?: Agent[];
+        settingsPatch?: Partial<RuntimeSettings>;
+      };
+    };
+    if (clientContext) {
+      store.hydrateFromClient(clientContext);
+    }
     const sender = store.getAgent(req.params.id);
     if (!sender) {
       res.status(404).json({ error: 'Bot pengirim tidak ditemukan' });
       return;
     }
-    const { toAgentId, content, createTask, title } = req.body as {
-      toAgentId?: string;
-      content?: string;
-      createTask?: boolean;
-      title?: string;
-    };
     if (!content?.trim()) {
       res.status(400).json({ error: 'Pesan tidak boleh kosong' });
       return;
@@ -195,7 +246,7 @@ export function createApiRouter(
         title: title?.trim() || `Perintah dari ${sender.name}`,
         instructions: content.trim(),
       });
-      res.json({ ok: true, task });
+      res.json({ ok: true, task, snapshot: store.getSnapshot() });
       return;
     }
 
@@ -203,7 +254,7 @@ export function createApiRouter(
       toAgentId: toAgentId || 'all',
       content: content.trim(),
     });
-    res.json({ ok: true });
+    res.json({ ok: true, snapshot: store.getSnapshot() });
   });
 
   router.post('/office/all-hands', (req, res) => {
@@ -235,12 +286,12 @@ export function createApiRouter(
             ? 'Istirahat sejenak — tim berjalan menuju Coffee Lounge.'
             : 'Seluruh bot kembali ke workstation masing-masing.',
     });
-    res.json({ ok: true });
+    res.json({ ok: true, snapshot: store.getSnapshot() });
   });
 
   router.post('/settings', (req, res) => {
     const updated = store.updateSettings(req.body || {});
-    res.json({ settings: updated });
+    res.json({ settings: updated, snapshot: store.getSnapshot() });
   });
 
   // --- External Bot REST Bridge Endpoints ---
@@ -270,7 +321,7 @@ export function createApiRouter(
       type: body.webhookUrl ? 'external-webhook' : 'external-ws',
       webhookUrl: body.webhookUrl,
     });
-    res.status(201).json({ agent });
+    res.status(201).json({ agent, snapshot: store.getSnapshot() });
   });
 
   router.post('/bridge/bots/:id/event', requireBridgeToken, async (req, res) => {

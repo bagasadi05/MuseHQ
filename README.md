@@ -29,6 +29,18 @@
 - **Demo Simulator (Aktif Langsung):** Bisa langsung dicoba tanpa API Key untuk melihat alur delegasi, animasi ruangan, dan simulasi deliverable.
 - **Cloud LLM API:** Klik tombol **API Keys** di header web (atau isi `.env` dari `.env.example`) untuk memakai **Google Gemini**, **OpenAI**, atau **Anthropic Claude** di tiap bot.
 
+## Deploy ke Vercel
+
+Project ini sudah siap dideploy langsung ke **Vercel** melalui [vercel.json](vercel.json) dan serverless handler [api/index.mjs](api/index.mjs):
+
+1. Import repository GitHub ini di dashboard Vercel (**Add New → Project**).
+2. Biarkan **Root Directory** di root (`.`), Vercel otomatis membaca `vercel.json` (`buildCommand: npm run build`, `outputDirectory: client/dist`).
+3. *(Opsional)* Tambahkan Environment Variables di Vercel:
+   - `DEFAULT_PROVIDER`: `gemini` / `openai` / `anthropic` / `demo`
+   - `GEMINI_API_KEY`, `OPENAI_API_KEY`, atau `ANTHROPIC_API_KEY`
+   - `BOT_BRIDGE_TOKEN`: token keamanan untuk REST Webhook bot eksternal
+4. Klik **Deploy**. Di Vercel, frontend otomatis memakai mode **Cloud Sync** (SSE real-time streaming + sinkronisasi state), dan bot eksternal dapat terhubung lewat **REST Webhook** (`/api/bridge/*`).
+
 ## Menguji Bot Eksternal (`examples/external-bot.mjs`)
 
 Setelah `npm run dev` berjalan, buka terminal kedua lalu jalankan:

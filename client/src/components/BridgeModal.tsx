@@ -18,9 +18,15 @@ export const BridgeModal: React.FC<BridgeModalProps> = ({
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   if (!open) return null;
 
+  const isLocal =
+    typeof window !== 'undefined' &&
+    (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
   const host = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
-  const wsUrl = `ws://${host}:3001/ws/bot?token=${bridgeToken}`;
-  const restUrl = `http://${host}:3001/api/bridge`;
+  const origin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3001';
+  const wsUrl = isLocal
+    ? `ws://${host}:3001/ws/bot?token=${bridgeToken}`
+    : `ws://localhost:3001/ws/bot?token=${bridgeToken}`;
+  const restUrl = isLocal ? `http://${host}:3001/api/bridge` : `${origin}/api/bridge`;
 
   const wsSnippet = `// Jalankan contoh bot eksternal langsung dari root project:
 // npm run example:bot

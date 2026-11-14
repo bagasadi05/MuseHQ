@@ -3,8 +3,12 @@
   "version": "1.0.0",
   "private": true,
   "description": "MuseHQ — Multi-Agent Virtual Office & Orchestration Hub for Muse AI Bots",
+  "workspaces": [
+    "server",
+    "client"
+  ],
   "scripts": {
-    "install:all": "npm --prefix server install && npm --prefix client install",
+    "install:all": "npm install",
     "dev": "node scripts/dev.mjs",
     "dev:server": "npm --prefix server run dev",
     "dev:client": "npm --prefix client run dev",
