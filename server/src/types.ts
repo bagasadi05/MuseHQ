@@ -1,13 +1,14 @@
 export type ZoneId =
   | 'command-desk'
-  | 'meeting-table'
-  | 'dev-bay'
-  | 'research-nook'
+  | 'research-library'
+  | 'engineering-bay'
+  | 'war-room'
   | 'creative-studio'
   | 'qa-bench'
-  | 'lounge';
+  | 'coffee-lounge';
 
 export type AgentStatus =
+  | 'online'
   | 'idle'
   | 'walking'
   | 'thinking'
@@ -16,7 +17,7 @@ export type AgentStatus =
   | 'offline'
   | 'error';
 
-export type AgentType = 'builtin' | 'external-ws' | 'external-webhook';
+export type AgentType = 'builtin' | 'external-ws' | 'external-rest' | 'external-webhook';
 
 export type LLMProvider = 'demo' | 'gemini' | 'openai' | 'anthropic';
 
@@ -64,10 +65,18 @@ export interface Agent {
   lastSeenAt: string;
 }
 
-export type TaskStatus = 'queued' | 'delegated' | 'working' | 'completed' | 'failed';
+export type TaskStatus =
+  | 'queued'
+  | 'waiting-dependency'
+  | 'assigned'
+  | 'delegated'
+  | 'working'
+  | 'completed'
+  | 'failed';
 
 export interface Task {
   id: string;
+  seq?: number;
   missionId: string;
   parentTaskId: string | null;
   title: string;
@@ -95,6 +104,7 @@ export interface Mission {
 
 export interface CommsMessage {
   id: string;
+  seq?: number;
   missionId?: string;
   fromId: string;
   fromName: string;
@@ -122,6 +132,13 @@ export interface CommandBeam {
   expiresAt: number;
 }
 
+export interface BridgeQueuedEvent {
+  seq: number;
+  event: string;
+  payload: Record<string, unknown>;
+  timestamp: string;
+}
+
 export interface RuntimeSettings {
   defaultProvider: LLMProvider;
   geminiApiKey: string;
@@ -131,6 +148,8 @@ export interface RuntimeSettings {
   openaiModel: string;
   anthropicModel: string;
   bridgeToken: string;
+  ownerPasscode: string;
+  sessionSecret: string;
 }
 
 export interface PublicSettings {
@@ -144,7 +163,9 @@ export interface PublicSettings {
   geminiModel: string;
   openaiModel: string;
   anthropicModel: string;
-  bridgeToken: string;
+  hasBridgeToken: boolean;
+  bridgeTokenPreview: string;
+  authConfigured: boolean;
 }
 
 export interface WorkspaceSnapshot {
@@ -154,4 +175,5 @@ export interface WorkspaceSnapshot {
   comms: CommsMessage[];
   beams: CommandBeam[];
   settings: PublicSettings;
+  cursor: number;
 }

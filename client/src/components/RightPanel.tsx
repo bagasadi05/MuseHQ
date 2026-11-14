@@ -9,6 +9,7 @@ import {
   FileText,
   ListChecks,
   MessageSquare,
+  RotateCcw,
   Send,
   Settings2,
   Trash2,
@@ -43,12 +44,18 @@ interface RightPanelProps {
   ) => Promise<void>;
   onOpenReport: (mission: Mission) => void;
   onClearHistory: () => Promise<void>;
+  onResetWorkspace: () => Promise<void>;
 }
 
 type TabId = 'comms' | 'tasks' | 'inspector';
 
 const STATUS_BADGES: Record<string, { label: string; cls: string }> = {
   queued: { label: 'Antre', cls: 'bg-slate-700/70 text-slate-300' },
+  'waiting-dependency': {
+    label: 'Tunggu Dependensi',
+    cls: 'bg-violet-500/20 text-violet-300',
+  },
+  assigned: { label: 'Ditugaskan', cls: 'bg-sky-500/20 text-sky-300' },
   delegated: { label: 'Menunggu Bot Luar', cls: 'bg-purple-500/20 text-purple-300' },
   working: { label: 'Dikerjakan', cls: 'bg-amber-500/20 text-amber-300' },
   completed: { label: 'Selesai', cls: 'bg-emerald-500/20 text-emerald-300' },
@@ -68,9 +75,11 @@ export const RightPanel: React.FC<RightPanelProps> = ({
   onSendBotCommand,
   onOpenReport,
   onClearHistory,
+  onResetWorkspace,
 }) => {
   const [tab, setTab] = useState<TabId>('comms');
   const [expandedTaskId, setExpandedTaskId] = useState<string | null>(null);
+  const [confirmReset, setConfirmReset] = useState(false);
 
   // Bot-to-bot manual relay state
   const [relayFrom, setRelayFrom] = useState('muse-lead');
@@ -156,6 +165,67 @@ export const RightPanel: React.FC<RightPanelProps> = ({
           </div>
         </div>
       )}
+
+      {/* Live Room Roster & Status Strip */}
+      <div className="border-b border-slate-800 bg-slate-950/35 px-3 py-2">
+        <div className="mb-1.5 flex items-center justify-between">
+          <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+            Bot Ruangan ({agents.length})
+          </span>
+          <button
+            type="button"
+            onClick={async () => {
+              if (!confirmReset) {
+                setConfirmReset(true);
+                setTimeout(() => setConfirmReset(false), 3000);
+                return;
+              }
+              setConfirmReset(false);
+              await onResetWorkspace();
+            }}
+            className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium transition cursor-pointer ${
+              confirmReset
+                ? 'bg-rose-500/25 text-rose-200 border border-rose-500/40'
+                : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+            }`}
+            title="Reset ruangan ke keadaan awal"
+          >
+            <RotateCcw className="h-2.5 w-2.5" />
+            <span>{confirmReset ? 'Klik lagi: Reset' : 'Reset Ruangan'}</span>
+          </button>
+        </div>
+        <div className="flex flex-wrap gap-1">
+          {agents.map((a) => {
+            const dotCls =
+              a.status === 'working'
+                ? 'bg-emerald-400 animate-pulse'
+                : a.status === 'online'
+                  ? 'bg-green-400'
+                  : a.status === 'thinking' || a.status === 'meeting'
+                    ? 'bg-amber-400'
+                    : a.status === 'offline' || a.status === 'error'
+                      ? 'bg-rose-500'
+                      : 'bg-sky-400';
+            return (
+              <button
+                key={a.id}
+                type="button"
+                onClick={() => onSelectAgent(a.id)}
+                title={`${a.name} — ${a.role} (${a.status})`}
+                className={`flex items-center gap-1.5 rounded-md border px-2 py-0.5 text-[11px] transition cursor-pointer ${
+                  selectedAgentId === a.id
+                    ? 'border-amber-400/70 bg-amber-500/15 text-amber-100'
+                    : 'border-slate-800 bg-slate-900/90 text-slate-300 hover:border-slate-700'
+                }`}
+              >
+                <span className={`h-1.5 w-1.5 rounded-full ${dotCls}`} />
+                <span className="font-medium">{a.name}</span>
+                <span className="font-mono text-[9px] text-slate-500">{a.status}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
 
       {/* Navigation Tabs */}
       <div className="flex items-center border-b border-slate-800 px-2 pt-2">
@@ -456,7 +526,7 @@ const BotInspector: React.FC<BotInspectorProps> = ({
   const [systemPrompt, setSystemPrompt] = useState('');
   const [provider, setProvider] = useState<LLMProvider>('demo');
   const [model, setModel] = useState('');
-  const [homeZone, setHomeZone] = useState<ZoneId>('dev-bay');
+  const [homeZone, setHomeZone] = useState<ZoneId>('engineering-bay');
   const [canDelegate, setCanDelegate] = useState(false);
   const [webhookUrl, setWebhookUrl] = useState('');
   const [savedNotice, setSavedNotice] = useState(false);

@@ -2,10 +2,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { pickSpotInZone } from './officeMap.js';
+import { normalizeZoneId, pickSpotInZone } from './officeMap.js';
+import { deriveDeterministicKey, generateSecureToken, isRetiredToken } from './security.js';
 import {
   Agent,
   AgentStatus,
+  BridgeQueuedEvent,
   CommandBeam,
   CommsMessage,
   Mission,
@@ -31,10 +33,19 @@ const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 export type BroadcastFn = (event: string, payload: unknown) => void;
 
 interface PersistedState {
+  cursor?: number;
   agents: Agent[];
   missions: Mission[];
   tasks: Task[];
   comms: CommsMessage[];
+}
+
+export interface StartupSecurityStatus {
+  generatedBridgeToken: boolean;
+  generatedOwnerPasscode: boolean;
+  bridgeTokenFromEnv: boolean;
+  ownerPasscodeFromEnv: boolean;
+  settingsFilePath: string;
 }
 
 function createDefaultAgents(defaultProvider: RuntimeSettings['defaultProvider']): Agent[] {
@@ -53,11 +64,11 @@ function createDefaultAgents(defaultProvider: RuntimeSettings['defaultProvider']
     {
       id: 'muse-lead',
       name: 'Muse Lead',
-      role: 'Orchestrator & Commander',
+      role: 'Orchestrator & Coordinator',
       description:
-        'Memecah perintah user menjadi sub-tugas terstruktur, mendelegasikan ke bot spesialis, lalu merangkum hasil akhir.',
+        'Koordinator misi (bukan pemilik): memecah perintah manusia menjadi sub-tugas terstruktur, mendelegasikan ke bot spesialis maupun bot rekan setara, lalu merangkum hasil akhir.',
       systemPrompt:
-        'Kamu adalah Muse Lead, koordinator utama tim bot Muse AI. Pecah tugas kompleks secara cerdas, delegasikan pekerjaan ke anggota tim yang paling relevan, dan rangkum laporan akhir dengan jelas.',
+        'Kamu adalah Muse Lead, koordinator misi di ruang kerja MuseHQ (pemilik adalah manusia/Commander, sedangkan muse-bagas, muse-arif, muse-joni, dan muse-niro adalah rekan setara). Pecah tugas kompleks secara cerdas, delegasikan pekerjaan ke bot spesialis atau rekan yang tepat, dan rangkum laporan akhir dengan jelas.',
       canDelegate: true,
       homeZone: 'command-desk',
       color: '#f59e0b',
@@ -72,7 +83,7 @@ function createDefaultAgents(defaultProvider: RuntimeSettings['defaultProvider']
       systemPrompt:
         'Kamu adalah Muse Scout, spesialis riset dan analisis strategi. Berikan temuan terstruktur, poin utama, risiko, dan rekomendasi berbasis konteks misi.',
       canDelegate: false,
-      homeZone: 'research-nook',
+      homeZone: 'research-library',
       color: '#06b6d4',
       avatarVariant: 'researcher',
     },
@@ -85,7 +96,7 @@ function createDefaultAgents(defaultProvider: RuntimeSettings['defaultProvider']
       systemPrompt:
         'Kamu adalah Muse Dev, software & AI systems engineer. Buat rancangan teknis yang konkret, bersih, dan siap dieksekusi lengkap dengan struktur komponen atau potongan kode.',
       canDelegate: false,
-      homeZone: 'dev-bay',
+      homeZone: 'engineering-bay',
       color: '#10b981',
       avatarVariant: 'coder',
     },
@@ -117,8 +128,10 @@ function createDefaultAgents(defaultProvider: RuntimeSettings['defaultProvider']
     },
   ];
 
+  const occupied: Array<{ x: number; y: number }> = [];
   return baseConfigs.map((cfg, idx) => {
-    const pos = pickSpotInZone(cfg.homeZone, idx);
+    const pos = pickSpotInZone(cfg.homeZone, idx, occupied);
+    occupied.push(pos);
     return {
       ...cfg,
       type: 'builtin',
@@ -143,13 +156,34 @@ function maskKey(key: string): string {
   return `${key.slice(0, 4)}••••${key.slice(-4)}`;
 }
 
+function createInitialComms(): CommsMessage[] {
+  return [
+    {
+      id: `msg-${Date.now()}`,
+      seq: 1,
+      fromId: 'system',
+      fromName: 'MuseHQ System',
+      toId: 'all',
+      toName: 'All Muse Bots',
+      kind: 'system',
+      content:
+        'Ruangan kerja MuseHQ aktif. Kirim misi di Command Bar atau sambungkan bot eksternal via External Bridge.',
+      timestamp: new Date().toISOString(),
+    },
+  ];
+}
+
 export class WorkspaceStore {
   private agents: Agent[] = [];
   private missions: Mission[] = [];
   private tasks: Task[] = [];
   private comms: CommsMessage[] = [];
   private beams: CommandBeam[] = [];
+  private cursor = 1;
+  private botOutbox = new Map<string, BridgeQueuedEvent[]>();
+  private processedBridgeEventIds = new Map<string, string[]>();
   private settings: RuntimeSettings;
+  private securityStatus: StartupSecurityStatus;
   private broadcaster: BroadcastFn = () => {};
   private subscribers = new Set<BroadcastFn>();
   private persistTimer: NodeJS.Timeout | null = null;
@@ -160,8 +194,14 @@ export class WorkspaceStore {
     } catch {
       // Ignore directory errors in strictly read-only environments
     }
-    this.settings = this.loadSettings();
+    const loaded = this.loadSettings();
+    this.settings = loaded.settings;
+    this.securityStatus = loaded.securityStatus;
     this.loadState();
+  }
+
+  getSecurityStatus(): StartupSecurityStatus {
+    return { ...this.securityStatus };
   }
 
   setBroadcaster(fn: BroadcastFn): void {
@@ -186,57 +226,122 @@ export class WorkspaceStore {
     }
   }
 
-  private loadSettings(): RuntimeSettings {
-    const envProvider = (process.env.DEFAULT_PROVIDER || 'demo') as RuntimeSettings['defaultProvider'];
-    const base: RuntimeSettings = {
-      defaultProvider: ['demo', 'gemini', 'openai', 'anthropic'].includes(envProvider)
-        ? envProvider
-        : 'demo',
-      geminiApiKey: process.env.GEMINI_API_KEY || '',
-      openaiApiKey: process.env.OPENAI_API_KEY || '',
-      anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
-      geminiModel: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
-      openaiModel: process.env.OPENAI_MODEL || 'gpt-4o-mini',
-      anthropicModel: process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-5',
-      bridgeToken: process.env.BOT_BRIDGE_TOKEN || 'muse-bridge-secret-dev',
-    };
+  nextCursor(): number {
+    this.cursor += 1;
+    return this.cursor;
+  }
 
-    if (fs.existsSync(SETTINGS_FILE)) {
+  private loadSettings(): {
+    settings: RuntimeSettings;
+    securityStatus: StartupSecurityStatus;
+  } {
+    const envProvider = (process.env.DEFAULT_PROVIDER || 'demo') as RuntimeSettings['defaultProvider'];
+    const rawEnvBridge = (process.env.BOT_BRIDGE_TOKEN || '').trim();
+    const envBridgeValid = !isRetiredToken(rawEnvBridge) ? rawEnvBridge : '';
+    const envOwnerPasscode = (process.env.MUSE_OWNER_PASSCODE || '').trim();
+    const envSessionSecret = (process.env.SESSION_SECRET || '').trim();
+
+    let saved: Partial<RuntimeSettings> = {};
+    if (!IS_SERVERLESS && fs.existsSync(SETTINGS_FILE)) {
       try {
-        const saved = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')) as Partial<RuntimeSettings>;
-        return {
-          ...base,
-          ...saved,
-          geminiApiKey: saved.geminiApiKey || base.geminiApiKey,
-          openaiApiKey: saved.openaiApiKey || base.openaiApiKey,
-          anthropicApiKey: saved.anthropicApiKey || base.anthropicApiKey,
-          bridgeToken: saved.bridgeToken || base.bridgeToken,
-        };
+        saved = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')) as Partial<RuntimeSettings>;
       } catch {
-        return base;
+        saved = {};
       }
     }
-    return base;
+
+    const savedBridgeValid = !isRetiredToken(saved.bridgeToken) ? saved.bridgeToken!.trim() : '';
+    const savedOwnerPasscode = typeof saved.ownerPasscode === 'string' ? saved.ownerPasscode.trim() : '';
+    const savedSessionSecret = typeof saved.sessionSecret === 'string' ? saved.sessionSecret.trim() : '';
+
+    let generatedBridgeToken = false;
+    let generatedOwnerPasscode = false;
+
+    let bridgeToken = envBridgeValid || savedBridgeValid;
+    if (!bridgeToken) {
+      bridgeToken = generateSecureToken('mhq_bot_', 24);
+      generatedBridgeToken = true;
+    }
+
+    let ownerPasscode = envOwnerPasscode || savedOwnerPasscode;
+    if (!ownerPasscode && !IS_SERVERLESS) {
+      ownerPasscode = generateSecureToken('mhq_own_', 12);
+      generatedOwnerPasscode = true;
+    }
+
+    let sessionSecret = envSessionSecret || savedSessionSecret;
+    if (!sessionSecret) {
+      sessionSecret = IS_SERVERLESS
+        ? deriveDeterministicKey(`${ownerPasscode}:${bridgeToken}`)
+        : generateSecureToken('mhq_ses_', 24);
+    }
+
+    const resolved: RuntimeSettings = {
+      defaultProvider: ['demo', 'gemini', 'openai', 'anthropic'].includes(envProvider)
+        ? envProvider
+        : saved.defaultProvider && ['demo', 'gemini', 'openai', 'anthropic'].includes(saved.defaultProvider)
+          ? saved.defaultProvider
+          : 'demo',
+      geminiApiKey: saved.geminiApiKey || process.env.GEMINI_API_KEY || '',
+      openaiApiKey: saved.openaiApiKey || process.env.OPENAI_API_KEY || '',
+      anthropicApiKey: saved.anthropicApiKey || process.env.ANTHROPIC_API_KEY || '',
+      geminiModel: saved.geminiModel || process.env.GEMINI_MODEL || 'gemini-2.5-flash',
+      openaiModel: saved.openaiModel || process.env.OPENAI_MODEL || 'gpt-4o-mini',
+      anthropicModel: saved.anthropicModel || process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-5',
+      bridgeToken,
+      ownerPasscode,
+      sessionSecret,
+    };
+
+    if (!IS_SERVERLESS) {
+      this.writeSettingsFile(resolved);
+    }
+
+    return {
+      settings: resolved,
+      securityStatus: {
+        generatedBridgeToken,
+        generatedOwnerPasscode,
+        bridgeTokenFromEnv: Boolean(envBridgeValid),
+        ownerPasscodeFromEnv: Boolean(envOwnerPasscode),
+        settingsFilePath: SETTINGS_FILE,
+      },
+    };
+  }
+
+  private writeSettingsFile(settings: RuntimeSettings): void {
+    try {
+      const tmpFile = `${SETTINGS_FILE}.tmp`;
+      fs.writeFileSync(tmpFile, JSON.stringify(settings, null, 2), { encoding: 'utf8', mode: 0o600 });
+      fs.renameSync(tmpFile, SETTINGS_FILE);
+    } catch {
+      // Ignore write failures in read-only runtimes
+    }
   }
 
   private loadState(): void {
     if (fs.existsSync(STATE_FILE)) {
       try {
         const parsed = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) as Partial<PersistedState>;
+        const occupied: Array<{ x: number; y: number }> = [];
         this.agents = (parsed.agents && parsed.agents.length > 0
           ? parsed.agents
           : createDefaultAgents(this.settings.defaultProvider)
         ).map((agent, idx) => {
+          const homeZone = normalizeZoneId(agent.homeZone) || 'coffee-lounge';
           const isExternalWs = agent.type === 'external-ws';
-          const fallbackPos = pickSpotInZone(agent.homeZone, idx);
+          const isRest = agent.type === 'external-rest';
+          const fallbackPos = pickSpotInZone(homeZone, idx, occupied);
+          occupied.push(fallbackPos);
           return {
             ...agent,
-            bridgeConnected: isExternalWs ? false : agent.type === 'builtin' || Boolean(agent.webhookUrl),
-            status: isExternalWs ? 'offline' : 'idle',
+            homeZone,
+            bridgeConnected: isExternalWs ? false : agent.type === 'builtin' || isRest || Boolean(agent.webhookUrl),
+            status: isExternalWs ? 'offline' : isRest ? 'online' : 'idle',
             currentTaskId: null,
             speechBubble: null,
-            currentZone: agent.homeZone,
-            targetZone: agent.homeZone,
+            currentZone: homeZone,
+            targetZone: homeZone,
             position: agent.position ?? fallbackPos,
             targetPosition: agent.position ?? fallbackPos,
           };
@@ -245,43 +350,44 @@ export class WorkspaceStore {
           m.status === 'running' ? { ...m, status: 'failed' as const } : m
         );
         this.tasks = (parsed.tasks || []).map((t) =>
-          t.status === 'working' || t.status === 'delegated' || t.status === 'queued'
+          t.status === 'working' ||
+          t.status === 'delegated' ||
+          t.status === 'queued' ||
+          t.status === 'waiting-dependency' ||
+          t.status === 'assigned'
             ? { ...t, status: 'failed' as const, error: t.error || 'Server restarted before completion' }
             : t
         );
         this.comms = (parsed.comms || []).slice(-200);
+        this.cursor = Math.max(
+          parsed.cursor || 1,
+          ...this.comms.map((c) => c.seq || 0),
+          ...this.tasks.map((t) => t.seq || 0)
+        );
         return;
       } catch {
         // Fall through to clean defaults on corrupt JSON
       }
     }
 
+    this.cursor = 1;
     this.agents = createDefaultAgents(this.settings.defaultProvider);
-    this.comms = [
-      {
-        id: `msg-${Date.now()}`,
-        fromId: 'system',
-        fromName: 'MuseHQ System',
-        toId: 'all',
-        toName: 'All Muse Bots',
-        kind: 'system',
-        content:
-          'Ruangan kerja MuseHQ aktif. Kirim misi di Command Bar atau sambungkan bot eksternal via External Bridge.',
-        timestamp: new Date().toISOString(),
-      },
-    ];
+    this.comms = createInitialComms();
     this.schedulePersist();
   }
 
   private writeStateToDisk(): void {
     try {
       const payload: PersistedState = {
+        cursor: this.cursor,
         agents: this.agents,
         missions: this.missions.slice(-50),
         tasks: this.tasks.slice(-250),
         comms: this.comms.slice(-200),
       };
-      fs.writeFileSync(STATE_FILE, JSON.stringify(payload, null, 2), 'utf8');
+      const tmpFile = `${STATE_FILE}.tmp`;
+      fs.writeFileSync(tmpFile, JSON.stringify(payload, null, 2), 'utf8');
+      fs.renameSync(tmpFile, STATE_FILE);
     } catch (err) {
       if (!IS_SERVERLESS) {
         console.error('Failed to persist workspace state:', err);
@@ -297,7 +403,7 @@ export class WorkspaceStore {
     if (this.persistTimer) clearTimeout(this.persistTimer);
     this.persistTimer = setTimeout(() => {
       this.writeStateToDisk();
-    }, 200);
+    }, 150);
   }
 
   getSettings(): RuntimeSettings {
@@ -316,13 +422,20 @@ export class WorkspaceStore {
       geminiModel: this.settings.geminiModel,
       openaiModel: this.settings.openaiModel,
       anthropicModel: this.settings.anthropicModel,
-      bridgeToken: this.settings.bridgeToken,
+      hasBridgeToken: Boolean(this.settings.bridgeToken),
+      bridgeTokenPreview: maskKey(this.settings.bridgeToken),
+      authConfigured: Boolean(this.settings.ownerPasscode),
     };
   }
 
   updateSettings(patch: Partial<RuntimeSettings>): PublicSettings {
     const cleanPatch: Partial<RuntimeSettings> = {};
-    if (patch.defaultProvider) cleanPatch.defaultProvider = patch.defaultProvider;
+    if (
+      patch.defaultProvider &&
+      ['demo', 'gemini', 'openai', 'anthropic'].includes(patch.defaultProvider)
+    ) {
+      cleanPatch.defaultProvider = patch.defaultProvider;
+    }
     if (typeof patch.geminiApiKey === 'string') cleanPatch.geminiApiKey = patch.geminiApiKey.trim();
     if (typeof patch.openaiApiKey === 'string') cleanPatch.openaiApiKey = patch.openaiApiKey.trim();
     if (typeof patch.anthropicApiKey === 'string') {
@@ -338,14 +451,23 @@ export class WorkspaceStore {
       cleanPatch.anthropicModel = patch.anthropicModel.trim();
     }
     if (typeof patch.bridgeToken === 'string' && patch.bridgeToken.trim()) {
-      cleanPatch.bridgeToken = patch.bridgeToken.trim();
+      const nextToken = patch.bridgeToken.trim();
+      if (isRetiredToken(nextToken)) {
+        throw new Error('Token bridge tidak memenuhi syarat keamanan minimum (minimal 8 karakter unik).');
+      }
+      cleanPatch.bridgeToken = nextToken;
+    }
+    if (typeof patch.ownerPasscode === 'string' && patch.ownerPasscode.trim()) {
+      const nextPass = patch.ownerPasscode.trim();
+      if (nextPass.length < 6) {
+        throw new Error('Owner passcode minimal 6 karakter.');
+      }
+      cleanPatch.ownerPasscode = nextPass;
     }
 
     this.settings = { ...this.settings, ...cleanPatch };
-    try {
-      fs.writeFileSync(SETTINGS_FILE, JSON.stringify(this.settings, null, 2), 'utf8');
-    } catch {
-      // Ignore write failures in ephemeral runtimes
+    if (!IS_SERVERLESS) {
+      this.writeSettingsFile(this.settings);
     }
 
     const publicSettings = this.getPublicSettings();
@@ -358,9 +480,12 @@ export class WorkspaceStore {
     settingsPatch?: Partial<RuntimeSettings>;
   }): void {
     if (!clientContext) return;
+    // Never accept bridgeToken, ownerPasscode, or sessionSecret from clientContext
     if (clientContext.settingsPatch) {
       const p = clientContext.settingsPatch;
-      if (p.defaultProvider) this.settings.defaultProvider = p.defaultProvider;
+      if (p.defaultProvider && ['demo', 'gemini', 'openai', 'anthropic'].includes(p.defaultProvider)) {
+        this.settings.defaultProvider = p.defaultProvider;
+      }
       if (p.geminiApiKey) this.settings.geminiApiKey = p.geminiApiKey;
       if (p.openaiApiKey) this.settings.openaiApiKey = p.openaiApiKey;
       if (p.anthropicApiKey) this.settings.anthropicApiKey = p.anthropicApiKey;
@@ -371,6 +496,7 @@ export class WorkspaceStore {
     if (Array.isArray(clientContext.agents) && clientContext.agents.length > 0) {
       for (const incoming of clientContext.agents) {
         if (!incoming?.id) continue;
+        const normalizedZone = normalizeZoneId(incoming.homeZone) || 'engineering-bay';
         const existing = this.getAgent(incoming.id);
         if (existing) {
           Object.assign(existing, {
@@ -380,15 +506,21 @@ export class WorkspaceStore {
             systemPrompt: incoming.systemPrompt || existing.systemPrompt,
             provider: incoming.provider || existing.provider,
             model: incoming.model ?? existing.model,
-            homeZone: incoming.homeZone || existing.homeZone,
+            homeZone: normalizedZone,
             canDelegate: incoming.canDelegate ?? existing.canDelegate,
             webhookUrl: incoming.webhookUrl ?? existing.webhookUrl,
             color: incoming.color || existing.color,
             avatarVariant: incoming.avatarVariant || existing.avatarVariant,
           });
         } else {
+          const spot = pickSpotInZone(normalizedZone, this.agents.length, this.getOccupiedInZone(normalizedZone));
           this.agents.push({
             ...incoming,
+            homeZone: normalizedZone,
+            currentZone: normalizedZone,
+            targetZone: normalizedZone,
+            position: spot,
+            targetPosition: { ...spot },
             status: incoming.type === 'external-ws' ? 'offline' : 'idle',
             currentTaskId: null,
             speechBubble: null,
@@ -398,7 +530,13 @@ export class WorkspaceStore {
     }
   }
 
-  getSnapshot(): WorkspaceSnapshot {
+  getOccupiedInZone(zone: ZoneId, excludeAgentId?: string): Array<{ x: number; y: number }> {
+    return this.agents
+      .filter((a) => a.id !== excludeAgentId && (a.currentZone === zone || a.targetZone === zone))
+      .map((a) => a.targetPosition || a.position);
+  }
+
+  getSnapshot(sinceSeq?: number): WorkspaceSnapshot {
     const now = Date.now();
     this.beams = this.beams.filter((b) => b.expiresAt > now);
     for (const agent of this.agents) {
@@ -406,14 +544,50 @@ export class WorkspaceStore {
         agent.speechBubble = null;
       }
     }
+    const minSeq = typeof sinceSeq === 'number' && Number.isFinite(sinceSeq) ? sinceSeq : 0;
     return {
       agents: this.agents,
       missions: this.missions,
-      tasks: this.tasks,
-      comms: this.comms,
+      tasks: minSeq > 0 ? this.tasks.filter((t) => (t.seq || 0) > minSeq) : this.tasks,
+      comms: minSeq > 0 ? this.comms.filter((c) => (c.seq || 0) > minSeq) : this.comms,
       beams: this.beams,
       settings: this.getPublicSettings(),
+      cursor: this.cursor,
     };
+  }
+
+  pushBotOutboxEvent(agentId: string, event: string, payload: Record<string, unknown>): BridgeQueuedEvent {
+    const entry: BridgeQueuedEvent = {
+      seq: this.nextCursor(),
+      event,
+      payload,
+      timestamp: new Date().toISOString(),
+    };
+    const queue = this.botOutbox.get(agentId) || [];
+    queue.push(entry);
+    if (queue.length > 200) {
+      this.botOutbox.set(agentId, queue.slice(-150));
+    } else {
+      this.botOutbox.set(agentId, queue);
+    }
+    return entry;
+  }
+
+  getBotOutboxEvents(agentId: string, sinceSeq = 0): BridgeQueuedEvent[] {
+    const queue = this.botOutbox.get(agentId) || [];
+    return queue.filter((e) => e.seq > sinceSeq);
+  }
+
+  recordBridgeEventId(agentId: string, eventId: string): boolean {
+    if (!eventId) return true;
+    const list = this.processedBridgeEventIds.get(agentId) || [];
+    if (list.includes(eventId)) return false;
+    list.push(eventId);
+    if (list.length > 300) {
+      list.shift();
+    }
+    this.processedBridgeEventIds.set(agentId, list);
+    return true;
   }
 
   getAgents(): Agent[] {
@@ -449,6 +623,8 @@ export class WorkspaceStore {
     const idx = this.agents.findIndex((a) => a.id === id);
     if (idx < 0) return false;
     this.agents.splice(idx, 1);
+    this.botOutbox.delete(id);
+    this.processedBridgeEventIds.delete(id);
     this.schedulePersist();
     this.emit('agent:removed', { id });
     return true;
@@ -458,7 +634,7 @@ export class WorkspaceStore {
     const agent = this.getAgent(agentId);
     if (!agent) return undefined;
 
-    const destination = pickSpotInZone(zone, spotSeed);
+    const destination = pickSpotInZone(zone, spotSeed, this.getOccupiedInZone(zone, agentId));
     const sameSpot =
       agent.currentZone === zone &&
       agent.position.x === destination.x &&
@@ -478,8 +654,6 @@ export class WorkspaceStore {
     this.emit('agent:updated', agent);
 
     if (IS_SERVERLESS) {
-      // Serverless functions cannot rely on deferred timers after response ends;
-      // client OfficeCanvas still smoothly interpolates the sprite along the floor.
       agent.currentZone = zone;
       agent.position = { ...destination };
       agent.status = nextStatus ?? 'idle';
@@ -488,7 +662,6 @@ export class WorkspaceStore {
       return agent;
     }
 
-    // Deterministic travel time so server state converges with smooth client A* walk
     setTimeout(() => {
       const current = this.getAgent(agentId);
       if (!current) return;
@@ -557,16 +730,20 @@ export class WorkspaceStore {
   }
 
   addTask(task: Task): Task {
-    this.tasks.push(task);
+    const withSeq: Task = { ...task, seq: this.nextCursor() };
+    this.tasks.push(withSeq);
     this.schedulePersist();
-    this.emit('task:updated', task);
-    return task;
+    this.emit('task:updated', withSeq);
+    return withSeq;
   }
 
   updateTask(id: string, patch: Partial<Task>): Task | undefined {
     const task = this.tasks.find((t) => t.id === id);
     if (!task) return undefined;
-    Object.assign(task, patch, { updatedAt: new Date().toISOString() });
+    Object.assign(task, patch, {
+      seq: this.nextCursor(),
+      updatedAt: new Date().toISOString(),
+    });
     this.schedulePersist();
     this.emit('task:updated', task);
     return task;
@@ -580,10 +757,11 @@ export class WorkspaceStore {
     return this.tasks.filter((t) => t.missionId === missionId);
   }
 
-  addComms(entry: Omit<CommsMessage, 'id' | 'timestamp'>): CommsMessage {
+  addComms(entry: Omit<CommsMessage, 'id' | 'timestamp' | 'seq'>): CommsMessage {
     const msg: CommsMessage = {
       ...entry,
       id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      seq: this.nextCursor(),
       timestamp: new Date().toISOString(),
     };
     this.comms.push(msg);
@@ -602,6 +780,7 @@ export class WorkspaceStore {
     this.comms = [
       {
         id: `msg-${Date.now()}`,
+        seq: this.nextCursor(),
         fromId: 'system',
         fromName: 'MuseHQ System',
         toId: 'all',
@@ -614,9 +793,26 @@ export class WorkspaceStore {
     for (const agent of this.agents) {
       agent.currentTaskId = null;
       agent.speechBubble = null;
-      if (agent.status !== 'offline') agent.status = 'idle';
+      if (agent.status !== 'offline') {
+        agent.status = agent.type === 'external-rest' ? 'online' : 'idle';
+      }
     }
     this.schedulePersist();
     this.emit('snapshot', this.getSnapshot());
+  }
+
+  resetWorkspace(): WorkspaceSnapshot {
+    this.missions = [];
+    this.tasks = [];
+    this.beams = [];
+    this.botOutbox.clear();
+    this.processedBridgeEventIds.clear();
+    this.agents = createDefaultAgents(this.settings.defaultProvider);
+    this.comms = createInitialComms();
+    this.cursor = 1;
+    this.schedulePersist();
+    const snap = this.getSnapshot();
+    this.emit('snapshot', snap);
+    return snap;
   }
 }

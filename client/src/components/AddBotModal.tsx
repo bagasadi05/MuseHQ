@@ -21,7 +21,7 @@ export const AddBotModal: React.FC<AddBotModalProps> = ({
   const [role, setRole] = useState('');
   const [type, setType] = useState<AgentType>('builtin');
   const [provider, setProvider] = useState<LLMProvider>(defaultProvider);
-  const [homeZone, setHomeZone] = useState<ZoneId>('dev-bay');
+  const [homeZone, setHomeZone] = useState<ZoneId>('engineering-bay');
   const [avatarVariant, setAvatarVariant] = useState<AvatarVariant>('coder');
   const [color, setColor] = useState('#14b8a6');
   const [webhookUrl, setWebhookUrl] = useState('');
@@ -111,6 +111,7 @@ export const AddBotModal: React.FC<AddBotModalProps> = ({
               >
                 <option value="builtin">Built-in AI Agent</option>
                 <option value="external-ws">External (WebSocket)</option>
+                <option value="external-rest">External (REST Polling)</option>
                 <option value="external-webhook">External (Webhook)</option>
               </select>
             </div>

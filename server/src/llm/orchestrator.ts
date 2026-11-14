@@ -44,7 +44,7 @@ export class MissionOrchestrator {
     this.store.addComms({
       missionId: mission.id,
       fromId: 'user',
-      fromName: 'Commander (You)',
+      fromName: 'Commander (Owner)',
       toId: target.id,
       toName: target.name,
       kind: 'command',
@@ -75,10 +75,11 @@ export class MissionOrchestrator {
         dependsOnTaskIds: [],
       });
       await this.executeTask(directTask);
+      await this.checkMissionCompletion(mission.id);
       return;
     }
 
-    this.store.moveAgentToZone(target.id, 'meeting-table', 0, 'thinking');
+    this.store.moveAgentToZone(target.id, 'war-room', 0, 'thinking');
     this.store.setSpeechBubble(target.id, 'Menganalisis perintah & menyusun tim...', 'command', 5000);
 
     this.store.addComms({
@@ -112,7 +113,7 @@ export class MissionOrchestrator {
         fromId: target.id,
         fromName: target.name,
         toId: 'user',
-        toName: 'Commander (You)',
+        toName: 'Commander (Owner)',
         kind: 'deliverable',
         content: answer,
       });
@@ -130,9 +131,10 @@ export class MissionOrchestrator {
       content: `${plan.thought} (${plan.delegations.length} sub-tugas dibagikan)`,
     });
 
-    // First create all tasks so index-based dependency wiring maps to real task IDs
+    // First create all tasks so index-based dependency wiring maps cleanly to real task IDs
     const createdTasks: Task[] = [];
     for (const del of plan.delegations) {
+      const hasDeps = Array.isArray(del.dependsOnIndex) && del.dependsOnIndex.length > 0;
       const task = this.createTask({
         missionId: mission.id,
         parentTaskId: null,
@@ -141,6 +143,7 @@ export class MissionOrchestrator {
         assignedToId: del.toAgentId,
         assignedById: target.id,
         dependsOnTaskIds: [],
+        initialStatus: hasDeps ? 'waiting-dependency' : 'queued',
       });
       createdTasks.push(task);
     }
@@ -149,14 +152,13 @@ export class MissionOrchestrator {
       const depIds = (del.dependsOnIndex || [])
         .filter((depIdx) => depIdx >= 0 && depIdx < createdTasks.length && depIdx !== idx)
         .map((depIdx) => createdTasks[depIdx].id);
-      if (depIds.length > 0) {
-        this.store.updateTask(createdTasks[idx].id, { dependsOnTaskIds: depIds });
-      }
+      this.store.updateTask(createdTasks[idx].id, {
+        dependsOnTaskIds: depIds,
+        status: depIds.length > 0 ? 'waiting-dependency' : 'queued',
+      });
     });
 
-    // Emit command beams & comms entries sequentially with subtle visual spacing
-    for (let i = 0; i < createdTasks.length; i++) {
-      const task = createdTasks[i];
+    for (const task of createdTasks) {
       const assignee = this.store.getAgent(task.assignedToId);
       if (assignee) {
         this.store.emitBeam(target.id, assignee.id, task.title, target.color);
@@ -184,12 +186,14 @@ export class MissionOrchestrator {
     assignedToId: string;
     assignedById: string;
     dependsOnTaskIds: string[];
+    initialStatus?: Task['status'];
   }): Task {
     const now = new Date().toISOString();
+    const { initialStatus, ...rest } = input;
     const task: Task = {
       id: `task-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      ...input,
-      status: 'queued',
+      ...rest,
+      status: initialStatus || (rest.dependsOnTaskIds.length > 0 ? 'waiting-dependency' : 'queued'),
       createdAt: now,
       updatedAt: now,
     };
@@ -211,7 +215,7 @@ export class MissionOrchestrator {
     let missionId = params.missionId;
     if (!missionId) {
       const m = this.store.addMission({
-        id: `mission-${Date.now()}`,
+        id: `mission-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
         prompt: `[Bot Delegation] ${params.title}`,
         targetAgentId: fromAgent.id,
         status: 'running',
@@ -231,7 +235,11 @@ export class MissionOrchestrator {
     });
 
     this.store.emitBeam(fromAgent.id, toAgent.id, params.title, fromAgent.color);
-    this.store.setSpeechBubble(fromAgent.id, `@${toAgent.name}, tolong kerjakan: ${params.title}`, 'command');
+    this.store.setSpeechBubble(
+      fromAgent.id,
+      `@${toAgent.name}, tolong kerjakan: ${params.title}`,
+      'command'
+    );
     this.store.addComms({
       missionId,
       fromId: fromAgent.id,
@@ -243,6 +251,7 @@ export class MissionOrchestrator {
     });
 
     await this.executeTask(task);
+    await this.checkMissionCompletion(missionId);
     return task;
   }
 
@@ -251,7 +260,7 @@ export class MissionOrchestrator {
     const taskMap = new Map(tasks.map((t) => [t.id, t]));
 
     const ready = tasks.filter((t) => {
-      if (t.status !== 'queued') return false;
+      if (t.status !== 'queued' && t.status !== 'waiting-dependency') return false;
       return t.dependsOnTaskIds.every((depId) => {
         const dep = taskMap.get(depId);
         return dep && (dep.status === 'completed' || dep.status === 'failed');
@@ -261,14 +270,18 @@ export class MissionOrchestrator {
     if (ready.length > 0) {
       await Promise.all(ready.map((t) => this.executeTask(t)));
     } else {
-      // Break potential LLM-generated dependency cycles if nothing is working/delegated
-      const inFlight = tasks.some((t) => t.status === 'working' || t.status === 'delegated');
-      const stuckQueued = tasks.filter((t) => t.status === 'queued');
-      if (!inFlight && stuckQueued.length > 0) {
-        for (const t of stuckQueued) {
-          this.store.updateTask(t.id, { dependsOnTaskIds: [] });
+      // Break potential LLM-generated dependency cycles if nothing is in-flight
+      const inFlight = tasks.some(
+        (t) => t.status === 'working' || t.status === 'delegated' || t.status === 'assigned'
+      );
+      const stuck = tasks.filter(
+        (t) => t.status === 'queued' || t.status === 'waiting-dependency'
+      );
+      if (!inFlight && stuck.length > 0) {
+        for (const t of stuck) {
+          this.store.updateTask(t.id, { dependsOnTaskIds: [], status: 'queued' });
         }
-        await Promise.all(stuckQueued.map((t) => this.executeTask(t)));
+        await Promise.all(stuck.map((t) => this.executeTask(t)));
       }
     }
 
@@ -293,19 +306,19 @@ export class MissionOrchestrator {
         result: t.result!,
       }));
 
-    this.store.updateTask(task.id, { status: 'working' });
     this.store.updateAgent(agent.id, { currentTaskId: task.id });
     this.store.moveAgentToZone(agent.id, agent.homeZone, 0, 'working');
-    this.store.setSpeechBubble(agent.id, `Mengerjakan: ${task.title}`, 'chat', 5000);
 
-    // Handle external bots via Bridge
-    if (agent.type === 'external-ws' || agent.type === 'external-webhook') {
+    // Handle external bots via Bridge (WebSocket, REST Polling, or Webhook)
+    if (agent.type !== 'builtin') {
       const contextStr = depOutputs
         .map((d) => `${d.agentName} (${d.title}):\n${d.result}`)
         .join('\n\n');
+      this.store.updateTask(task.id, { status: 'assigned' });
+      this.store.setSpeechBubble(agent.id, `Menerima tugas: ${task.title}`, 'command', 5000);
+
       const delivered = await this.bridge.dispatchTaskToExternalBot(agent, task, contextStr);
       if (delivered) {
-        this.store.updateTask(task.id, { status: 'delegated' });
         this.store.addComms({
           missionId: mission.id,
           fromId: 'system',
@@ -313,12 +326,11 @@ export class MissionOrchestrator {
           toId: agent.id,
           toName: agent.name,
           kind: 'progress',
-          content: `Tugas "${task.title}" dikirim ke bot eksternal ${agent.name}. Menunggu respons...`,
+          content: `Tugas "${task.title}" dikirim ke bot eksternal ${agent.name} (${agent.type}). Menunggu pengerjaan...`,
         });
         return; // Will resume when external bot reports task:complete / task:fail
       }
 
-      // External bot disconnected: inform user & fail cleanly so mission doesn't hang
       const errMsg = `Bot eksternal ${agent.name} sedang offline atau webhook gagal dijangkau.`;
       this.store.updateTask(task.id, { status: 'failed', error: errMsg });
       this.store.updateAgent(agent.id, { currentTaskId: null, status: 'offline' });
@@ -337,6 +349,9 @@ export class MissionOrchestrator {
     }
 
     // Built-in LLM or Demo agent execution
+    this.store.updateTask(task.id, { status: 'working' });
+    this.store.setSpeechBubble(agent.id, `Mengerjakan: ${task.title}`, 'chat', 5000);
+
     const depth = task.parentTaskId ? 1 : 0;
     const output = await executeWorkerTask(
       agent,
@@ -367,7 +382,7 @@ export class MissionOrchestrator {
       fromId: agent.id,
       fromName: agent.name,
       toId: coordinator?.id || 'user',
-      toName: coordinator?.name || 'Commander (You)',
+      toName: coordinator?.name || 'Commander (Owner)',
       kind: 'deliverable',
       content: output.result,
     });
@@ -375,9 +390,22 @@ export class MissionOrchestrator {
     await this.dispatchReadyTasks(mission.id);
   }
 
-  async completeExternalTask(taskId: string, result: string, speech?: string): Promise<void> {
+  async completeExternalTask(
+    taskId: string,
+    result: string,
+    speech?: string,
+    reportingAgentId?: string
+  ): Promise<{ applied: boolean; duplicate?: boolean; reason?: string }> {
     const task = this.store.getTask(taskId);
-    if (!task) return;
+    if (!task) return { applied: false, reason: 'Tugas tidak ditemukan' };
+
+    if (reportingAgentId && task.assignedToId !== reportingAgentId) {
+      return { applied: false, reason: 'Tugas ini bukan milik bot pengirim' };
+    }
+
+    if (task.status === 'completed' || task.status === 'failed') {
+      return { applied: true, duplicate: true };
+    }
 
     const agent = this.store.getAgent(task.assignedToId);
     this.store.updateTask(taskId, {
@@ -387,7 +415,10 @@ export class MissionOrchestrator {
     });
 
     if (agent) {
-      this.store.updateAgent(agent.id, { currentTaskId: null, status: 'idle' });
+      this.store.updateAgent(agent.id, {
+        currentTaskId: null,
+        status: agent.type === 'external-rest' ? 'online' : 'idle',
+      });
       this.store.setSpeechBubble(agent.id, speech || 'Tugas eksternal selesai!', 'report', 6000);
       const coordinator = this.store.getAgent(task.assignedById);
       if (coordinator) {
@@ -398,18 +429,31 @@ export class MissionOrchestrator {
         fromId: agent.id,
         fromName: agent.name,
         toId: coordinator?.id || 'user',
-        toName: coordinator?.name || 'Commander',
+        toName: coordinator?.name || 'Commander (Owner)',
         kind: 'deliverable',
         content: result,
       });
     }
 
     await this.dispatchReadyTasks(task.missionId);
+    return { applied: true };
   }
 
-  async failExternalTask(taskId: string, error: string): Promise<void> {
+  async failExternalTask(
+    taskId: string,
+    error: string,
+    reportingAgentId?: string
+  ): Promise<{ applied: boolean; duplicate?: boolean; reason?: string }> {
     const task = this.store.getTask(taskId);
-    if (!task) return;
+    if (!task) return { applied: false, reason: 'Tugas tidak ditemukan' };
+
+    if (reportingAgentId && task.assignedToId !== reportingAgentId) {
+      return { applied: false, reason: 'Tugas ini bukan milik bot pengirim' };
+    }
+
+    if (task.status === 'completed' || task.status === 'failed') {
+      return { applied: true, duplicate: true };
+    }
 
     const agent = this.store.getAgent(task.assignedToId);
     this.store.updateTask(taskId, { status: 'failed', error });
@@ -428,6 +472,7 @@ export class MissionOrchestrator {
     }
 
     await this.dispatchReadyTasks(task.missionId);
+    return { applied: true };
   }
 
   private async checkMissionCompletion(missionId: string): Promise<void> {
@@ -439,8 +484,8 @@ export class MissionOrchestrator {
     const tasks = this.store.getTasksByMission(missionId);
     if (tasks.length === 0) return;
 
-    const stillActive = tasks.some(
-      (t) => t.status === 'queued' || t.status === 'working' || t.status === 'delegated'
+    const stillActive = tasks.some((t) =>
+      ['queued', 'waiting-dependency', 'assigned', 'working', 'delegated'].includes(t.status)
     );
     if (stillActive) return;
 
@@ -467,7 +512,7 @@ export class MissionOrchestrator {
       if (tasks.length === 1 && completedDeliverables.length === 1 && !lead?.canDelegate) {
         finalSummary = completedDeliverables[0].result;
       } else if (lead && completedDeliverables.length > 0) {
-        this.store.moveAgentToZone(lead.id, 'meeting-table', 0, 'thinking');
+        this.store.moveAgentToZone(lead.id, 'war-room', 0, 'thinking');
         this.store.setSpeechBubble(lead.id, 'Menyusun laporan akhir tim...', 'command', 4500);
         const synthesis = await synthesizeMissionReport(
           lead,
@@ -482,7 +527,7 @@ export class MissionOrchestrator {
           fromId: lead.id,
           fromName: lead.name,
           toId: 'user',
-          toName: 'Commander (You)',
+          toName: 'Commander (Owner)',
           kind: 'deliverable',
           content: finalSummary,
         });

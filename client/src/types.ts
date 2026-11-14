@@ -1,13 +1,14 @@
 export type ZoneId =
   | 'command-desk'
-  | 'meeting-table'
-  | 'dev-bay'
-  | 'research-nook'
+  | 'research-library'
+  | 'engineering-bay'
+  | 'war-room'
   | 'creative-studio'
   | 'qa-bench'
-  | 'lounge';
+  | 'coffee-lounge';
 
 export type AgentStatus =
+  | 'online'
   | 'idle'
   | 'walking'
   | 'thinking'
@@ -16,7 +17,7 @@ export type AgentStatus =
   | 'offline'
   | 'error';
 
-export type AgentType = 'builtin' | 'external-ws' | 'external-webhook';
+export type AgentType = 'builtin' | 'external-ws' | 'external-rest' | 'external-webhook';
 
 export type LLMProvider = 'demo' | 'gemini' | 'openai' | 'anthropic';
 
@@ -64,10 +65,18 @@ export interface Agent {
   lastSeenAt: string;
 }
 
-export type TaskStatus = 'queued' | 'delegated' | 'working' | 'completed' | 'failed';
+export type TaskStatus =
+  | 'queued'
+  | 'waiting-dependency'
+  | 'assigned'
+  | 'delegated'
+  | 'working'
+  | 'completed'
+  | 'failed';
 
 export interface Task {
   id: string;
+  seq?: number;
   missionId: string;
   parentTaskId: string | null;
   title: string;
@@ -95,6 +104,7 @@ export interface Mission {
 
 export interface CommsMessage {
   id: string;
+  seq?: number;
   missionId?: string;
   fromId: string;
   fromName: string;
@@ -133,7 +143,9 @@ export interface PublicSettings {
   geminiModel: string;
   openaiModel: string;
   anthropicModel: string;
-  bridgeToken: string;
+  hasBridgeToken: boolean;
+  bridgeTokenPreview: string;
+  authConfigured: boolean;
 }
 
 export interface WorkspaceSnapshot {
@@ -143,6 +155,7 @@ export interface WorkspaceSnapshot {
   comms: CommsMessage[];
   beams: CommandBeam[];
   settings: PublicSettings;
+  cursor?: number;
 }
 
 export interface ZoneMeta {
@@ -164,7 +177,7 @@ export const ZONES_META: ZoneMeta[] = [
     bounds: { x: 1, y: 1, w: 5, h: 4 },
   },
   {
-    id: 'research-nook',
+    id: 'research-library',
     label: 'Research Library',
     shortLabel: 'RSC',
     accent: '#06b6d4',
@@ -172,17 +185,17 @@ export const ZONES_META: ZoneMeta[] = [
     bounds: { x: 7, y: 1, w: 6, h: 4 },
   },
   {
-    id: 'dev-bay',
+    id: 'engineering-bay',
     label: 'Engineering Bay',
-    shortLabel: 'DEV',
+    shortLabel: 'ENG',
     accent: '#10b981',
     floorTint: 'rgba(16, 185, 129, 0.12)',
     bounds: { x: 14, y: 1, w: 5, h: 5 },
   },
   {
-    id: 'meeting-table',
-    label: 'War Room / Meeting',
-    shortLabel: 'MTG',
+    id: 'war-room',
+    label: 'War Room',
+    shortLabel: 'WAR',
     accent: '#8b5cf6',
     floorTint: 'rgba(139, 92, 246, 0.14)',
     bounds: { x: 7, y: 5, w: 6, h: 4 },
@@ -204,11 +217,26 @@ export const ZONES_META: ZoneMeta[] = [
     bounds: { x: 14, y: 7, w: 5, h: 4 },
   },
   {
-    id: 'lounge',
+    id: 'coffee-lounge',
     label: 'Coffee Lounge',
-    shortLabel: 'BRK',
+    shortLabel: 'COF',
     accent: '#f97316',
     floorTint: 'rgba(249, 115, 22, 0.13)',
     bounds: { x: 7, y: 10, w: 6, h: 3 },
   },
 ];
+
+const LEGACY_ZONE_MAP: Record<string, ZoneId> = {
+  'research-nook': 'research-library',
+  'dev-bay': 'engineering-bay',
+  'meeting-table': 'war-room',
+  lounge: 'coffee-lounge',
+};
+
+export function normalizeZoneId(raw: unknown): ZoneId {
+  if (typeof raw === 'string') {
+    if (ZONES_META.some((z) => z.id === raw)) return raw as ZoneId;
+    if (raw in LEGACY_ZONE_MAP) return LEGACY_ZONE_MAP[raw];
+  }
+  return 'engineering-bay';
+}

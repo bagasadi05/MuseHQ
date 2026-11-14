@@ -8,12 +8,13 @@
     "client"
   ],
   "scripts": {
-    "install:all": "npm install",
+    "install:all": "npm install --include=optional --no-package-lock",
     "dev": "node scripts/dev.mjs",
     "dev:server": "npm --prefix server run dev",
     "dev:client": "npm --prefix client run dev",
     "build": "npm --prefix server run build && npm --prefix client run build",
     "start": "npm --prefix server start",
-    "example:bot": "node examples/external-bot.mjs"
+    "example:bot": "node examples/external-bot.mjs",
+    "example:rest-bot": "node examples/rest-polling-bot.mjs"
   }
 }

@@ -8,7 +8,7 @@ interface OfficeCanvasProps {
   selectedAgentId: string | null;
   onSelectAgent: (agentId: string | null) => void;
   onMoveAgent: (agentId: string, zone: ZoneId) => void;
-  onAllHands: (mode: 'meeting' | 'desks' | 'lounge') => void;
+  onAllHands: (mode: 'war-room' | 'desks' | 'coffee-lounge') => void;
 }
 
 const MAP_W = 20;
@@ -328,11 +328,13 @@ function drawPixelBot(
   const statusColor =
     agent.status === 'working'
       ? '#10b981'
-      : agent.status === 'thinking' || agent.status === 'meeting'
-        ? '#fbbf24'
-        : agent.status === 'offline' || agent.status === 'error'
-          ? '#ef4444'
-          : '#38bdf8';
+      : agent.status === 'online'
+        ? '#22c55e'
+        : agent.status === 'thinking' || agent.status === 'meeting'
+          ? '#fbbf24'
+          : agent.status === 'offline' || agent.status === 'error'
+            ? '#ef4444'
+            : '#38bdf8';
   ctx.fillStyle = statusColor;
   ctx.beginPath();
   ctx.arc(pillX + 7, pillY + 8, 2.7, 0, Math.PI * 2);
@@ -342,6 +344,18 @@ function drawPixelBot(
   ctx.textAlign = 'left';
   ctx.textBaseline = 'middle';
   ctx.fillText(labelText, pillX + 13, pillY + 8.5);
+
+  // Subtle Role Sub-tag beneath Nameplate
+  const shortRole = agent.role.length > 26 ? `${agent.role.slice(0, 24)}..` : agent.role;
+  ctx.font = '500 8px "JetBrains Mono", monospace';
+  const roleW = ctx.measureText(shortRole).width + 10;
+  ctx.fillStyle = 'rgba(2, 6, 23, 0.72)';
+  ctx.beginPath();
+  ctx.roundRect(sx - roleW / 2, pillY + 17.5, roleW, 11.5, 3);
+  ctx.fill();
+  ctx.fillStyle = isOffline ? '#64748b' : '#94a3b8';
+  ctx.textAlign = 'center';
+  ctx.fillText(shortRole, sx, pillY + 23.5);
 
   ctx.restore();
 }
@@ -642,12 +656,12 @@ export const OfficeCanvas: React.FC<OfficeCanvasProps> = ({
       drawables.push({
         gx: 10,
         gy: 2.1,
-        draw: (c) => drawDeskProp(c, 10, 2.1, '#06b6d4', t, deskCheck('research-nook')),
+        draw: (c) => drawDeskProp(c, 10, 2.1, '#06b6d4', t, deskCheck('research-library')),
       });
       drawables.push({
         gx: 16.2,
         gy: 2.3,
-        draw: (c) => drawDeskProp(c, 16.2, 2.3, '#10b981', t, deskCheck('dev-bay')),
+        draw: (c) => drawDeskProp(c, 16.2, 2.3, '#10b981', t, deskCheck('engineering-bay')),
       });
       // Server Rack in Dev Bay
       drawables.push({
@@ -995,12 +1009,12 @@ export const OfficeCanvas: React.FC<OfficeCanvasProps> = ({
         <div className="pointer-events-auto ml-auto flex flex-wrap items-center gap-1.5">
           <button
             type="button"
-            onClick={() => onAllHands('meeting')}
+            onClick={() => onAllHands('war-room')}
             className="flex items-center gap-1.5 rounded-lg border border-violet-500/40 bg-slate-900/85 px-2.5 py-1.5 text-xs font-medium text-violet-200 backdrop-blur-md transition hover:bg-violet-500/20 cursor-pointer"
-            title="Kumpulkan semua bot di ruang meeting"
+            title="Kumpulkan semua bot di War Room"
           >
             <Users className="h-3.5 w-3.5" />
-            <span>Meeting</span>
+            <span>War Room</span>
           </button>
           <button
             type="button"
@@ -1013,7 +1027,7 @@ export const OfficeCanvas: React.FC<OfficeCanvasProps> = ({
           </button>
           <button
             type="button"
-            onClick={() => onAllHands('lounge')}
+            onClick={() => onAllHands('coffee-lounge')}
             className="flex items-center gap-1.5 rounded-lg border border-orange-500/35 bg-slate-900/85 px-2.5 py-1.5 text-xs font-medium text-orange-200 backdrop-blur-md transition hover:bg-orange-500/20 cursor-pointer"
             title="Istirahat di Coffee Lounge"
           >

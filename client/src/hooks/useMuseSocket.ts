@@ -8,12 +8,14 @@ import {
   Task,
   WorkspaceSnapshot,
   ZoneId,
+  normalizeZoneId,
 } from '../types';
 
 export type TransportMode = 'ws' | 'cloud';
+export type AuthStatus = 'checking' | 'locked' | 'setup-required' | 'authenticated';
 
-const CLOUD_CACHE_KEY = 'musehq_cloud_workspace_v1';
-const CLOUD_SETTINGS_KEY = 'musehq_cloud_settings_v1';
+const CLOUD_CACHE_KEY = 'musehq_cloud_workspace_v2';
+const CLOUD_SETTINGS_KEY = 'musehq_cloud_settings_v2';
 
 const DEFAULT_SETTINGS: PublicSettings = {
   defaultProvider: 'demo',
@@ -26,17 +28,29 @@ const DEFAULT_SETTINGS: PublicSettings = {
   geminiModel: 'gemini-2.5-flash',
   openaiModel: 'gpt-4o-mini',
   anthropicModel: 'claude-sonnet-4-5',
-  bridgeToken: 'muse-bridge-secret-dev',
+  hasBridgeToken: false,
+  bridgeTokenPreview: '',
+  authConfigured: true,
 };
+
+class ApiHttpError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number
+  ) {
+    super(message);
+  }
+}
 
 async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
+    credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
     ...init,
   });
   if (!res.ok) {
     const errBody = (await res.json().catch(() => ({}))) as { error?: string };
-    throw new Error(errBody.error || `HTTP ${res.status}`);
+    throw new ApiHttpError(errBody.error || `HTTP ${res.status}`, res.status);
   }
   return (await res.json()) as T;
 }
@@ -58,9 +72,32 @@ function saveJsonStorage(key: string, value: unknown): void {
   }
 }
 
+function removeStorage(key: string): void {
+  try {
+    localStorage.removeItem(key);
+  } catch {
+    // Ignore
+  }
+}
+
+function normalizeSnapshotZones(snap: WorkspaceSnapshot): WorkspaceSnapshot {
+  return {
+    ...snap,
+    agents: (snap.agents || []).map((a) => ({
+      ...a,
+      homeZone: normalizeZoneId(a.homeZone),
+      currentZone: normalizeZoneId(a.currentZone),
+      targetZone: normalizeZoneId(a.targetZone),
+    })),
+  };
+}
+
 export function useMuseSocket() {
+  const [authStatus, setAuthStatus] = useState<AuthStatus>('checking');
+  const [authError, setAuthError] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
   const [transportMode, setTransportMode] = useState<TransportMode>('ws');
+  const [isServerless, setIsServerless] = useState(false);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [missions, setMissions] = useState<Mission[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -73,7 +110,8 @@ export function useMuseSocket() {
   const agentsRef = useRef<Agent[]>([]);
   agentsRef.current = agents;
 
-  const applySnapshot = useCallback((snap: WorkspaceSnapshot) => {
+  const applySnapshot = useCallback((rawSnap: WorkspaceSnapshot) => {
+    const snap = normalizeSnapshotZones(rawSnap);
     setAgents(snap.agents || []);
     setMissions(snap.missions || []);
     setTasks(snap.tasks || []);
@@ -145,18 +183,53 @@ export function useMuseSocket() {
     [applySnapshot]
   );
 
-  // Persist cloud workspace state locally so Vercel cold starts never lose custom bots or history
+  // Check session state first on initial load
   useEffect(() => {
-    if (transportMode !== 'cloud' || agents.length === 0) return;
+    let active = true;
+    const checkSession = async () => {
+      try {
+        const session = await apiJson<{
+          authenticated: boolean;
+          authConfigured: boolean;
+          serverless: boolean;
+        }>('/api/auth/session');
+        if (!active) return;
+        setIsServerless(Boolean(session.serverless));
+        if (!session.authConfigured) {
+          setAuthStatus('setup-required');
+        } else if (session.authenticated) {
+          setAuthStatus('authenticated');
+        } else {
+          setAuthStatus('locked');
+        }
+      } catch {
+        if (active) setAuthStatus('locked');
+      }
+    };
+    void checkSession();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  // Persist cloud workspace state locally ONLY while authenticated in Cloud mode
+  useEffect(() => {
+    if (authStatus !== 'authenticated' || transportMode !== 'cloud' || agents.length === 0) return;
     saveJsonStorage(CLOUD_CACHE_KEY, {
       agents,
       missions: missions.slice(-30),
       tasks: tasks.slice(-150),
       comms: comms.slice(-150),
     });
-  }, [transportMode, agents, missions, tasks, comms]);
+  }, [authStatus, transportMode, agents, missions, tasks, comms]);
 
+  // Connect WebSocket / Cloud Sync once owner session is authenticated
   useEffect(() => {
+    if (authStatus !== 'authenticated') {
+      setConnected(false);
+      return;
+    }
+
     let active = true;
     let socket: WebSocket | null = null;
 
@@ -170,9 +243,13 @@ export function useMuseSocket() {
         if (active) setConnected(true);
       };
 
-      socket.onclose = () => {
+      socket.onclose = (evt) => {
         if (!active) return;
         setConnected(false);
+        if (evt.code === 4001) {
+          setAuthStatus('locked');
+          return;
+        }
         reconnectTimer.current = window.setTimeout(connectWebSocket, 1800);
       };
 
@@ -188,17 +265,18 @@ export function useMuseSocket() {
     };
 
     const boot = async () => {
-      let isServerless = false;
+      let serverless = false;
       try {
         const health = await apiJson<{ serverless?: boolean }>('/api/health');
-        isServerless = Boolean(health.serverless);
+        serverless = Boolean(health.serverless);
       } catch {
         // Fallback to standard WS attempt
       }
 
       if (!active) return;
+      setIsServerless(serverless);
 
-      if (isServerless) {
+      if (serverless) {
         transportRef.current = 'cloud';
         setTransportMode('cloud');
         setConnected(true);
@@ -229,7 +307,11 @@ export function useMuseSocket() {
           } else {
             applySnapshot(snap);
           }
-        } catch {
+        } catch (err) {
+          if (err instanceof ApiHttpError && err.status === 401) {
+            setAuthStatus('locked');
+            return;
+          }
           if (cached?.agents) {
             applySnapshot({
               agents: cached.agents,
@@ -251,7 +333,11 @@ export function useMuseSocket() {
         .then((snap) => {
           if (active) applySnapshot(snap);
         })
-        .catch(() => {});
+        .catch((err) => {
+          if (active && err instanceof ApiHttpError && err.status === 401) {
+            setAuthStatus('locked');
+          }
+        });
     };
 
     void boot();
@@ -261,9 +347,8 @@ export function useMuseSocket() {
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       socket?.close();
     };
-  }, [applyEvent, applySnapshot]);
+  }, [authStatus, applyEvent, applySnapshot]);
 
-  // Periodically prune expired beams locally so canvas stays crisp
   useEffect(() => {
     const id = window.setInterval(() => {
       const now = Date.now();
@@ -275,14 +360,48 @@ export function useMuseSocket() {
     return () => clearInterval(id);
   }, []);
 
+  const login = useCallback(async (passcode: string) => {
+    setAuthError(null);
+    try {
+      await apiJson<{ ok: boolean }>('/api/auth/login', {
+        method: 'POST',
+        body: JSON.stringify({ passcode }),
+      });
+      setAuthStatus('authenticated');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Login gagal';
+      setAuthError(msg);
+      throw err;
+    }
+  }, []);
+
+  const logout = useCallback(async () => {
+    await apiJson('/api/auth/logout', { method: 'POST' }).catch(() => {});
+    setAgents([]);
+    setMissions([]);
+    setTasks([]);
+    setComms([]);
+    setBeams([]);
+    setConnected(false);
+    setAuthStatus('locked');
+  }, []);
+
+  const handleAuthGuard = (err: unknown): never => {
+    if (err instanceof ApiHttpError && err.status === 401) {
+      setAuthStatus('locked');
+    }
+    throw err;
+  };
+
   const syncFromMutation = useCallback(
     (res: { snapshot?: WorkspaceSnapshot; agent?: Agent }) => {
       if (transportRef.current !== 'cloud') return;
       if (res.agent) {
         applyEvent('agent:updated', res.agent);
       } else if (res.snapshot) {
-        if (res.snapshot.agents) setAgents(res.snapshot.agents);
-        if (res.snapshot.settings) setSettings(res.snapshot.settings);
+        const snap = normalizeSnapshotZones(res.snapshot);
+        if (snap.agents) setAgents(snap.agents);
+        if (snap.settings) setSettings(snap.settings);
       }
     },
     [applyEvent]
@@ -294,12 +413,13 @@ export function useMuseSocket() {
         return apiJson<{ mission: Mission }>('/api/missions', {
           method: 'POST',
           body: JSON.stringify({ prompt, targetAgentId }),
-        });
+        }).catch(handleAuthGuard);
       }
 
       const settingsPatch = loadJsonStorage<Record<string, string>>(CLOUD_SETTINGS_KEY) || undefined;
       const res = await fetch('/api/missions', {
         method: 'POST',
+        credentials: 'same-origin',
         headers: {
           'Content-Type': 'application/json',
           Accept: 'text/event-stream',
@@ -314,6 +434,11 @@ export function useMuseSocket() {
           },
         }),
       });
+
+      if (res.status === 401) {
+        setAuthStatus('locked');
+        throw new Error('Sesi berakhir, silakan login ulang.');
+      }
 
       if (!res.ok || !res.body) {
         const errBody = (await res.json().catch(() => ({}))) as { error?: string };
@@ -353,7 +478,7 @@ export function useMuseSocket() {
       const res = await apiJson<{ agent: Agent; snapshot?: WorkspaceSnapshot }>('/api/agents', {
         method: 'POST',
         body: JSON.stringify(payload),
-      });
+      }).catch(handleAuthGuard);
       syncFromMutation(res);
       return res;
     },
@@ -368,7 +493,7 @@ export function useMuseSocket() {
           method: 'PATCH',
           body: JSON.stringify(patch),
         }
-      );
+      ).catch(handleAuthGuard);
       syncFromMutation(res);
       return res;
     },
@@ -378,7 +503,7 @@ export function useMuseSocket() {
   const deleteAgent = useCallback(async (id: string) => {
     const res = await apiJson<{ ok: boolean }>(`/api/agents/${encodeURIComponent(id)}`, {
       method: 'DELETE',
-    });
+    }).catch(handleAuthGuard);
     if (transportRef.current === 'cloud') {
       setAgents((prev) => prev.filter((a) => a.id !== id));
     }
@@ -393,7 +518,7 @@ export function useMuseSocket() {
           method: 'POST',
           body: JSON.stringify({ zone }),
         }
-      );
+      ).catch(handleAuthGuard);
       syncFromMutation(res);
       return res;
     },
@@ -426,7 +551,7 @@ export function useMuseSocket() {
               : {}),
           }),
         }
-      );
+      ).catch(handleAuthGuard);
       if (transportRef.current === 'cloud' && res.snapshot) {
         if (res.snapshot.tasks) {
           for (const t of res.snapshot.tasks) applyEvent('task:updated', t);
@@ -443,14 +568,14 @@ export function useMuseSocket() {
   );
 
   const triggerAllHands = useCallback(
-    async (mode: 'meeting' | 'desks' | 'lounge') => {
+    async (mode: 'war-room' | 'desks' | 'coffee-lounge') => {
       const res = await apiJson<{ ok: boolean; snapshot?: WorkspaceSnapshot }>(
         '/api/office/all-hands',
         {
           method: 'POST',
           body: JSON.stringify({ mode }),
         }
-      );
+      ).catch(handleAuthGuard);
       if (transportRef.current === 'cloud' && res.snapshot) {
         if (res.snapshot.agents) setAgents(res.snapshot.agents);
         if (res.snapshot.comms) {
@@ -464,13 +589,15 @@ export function useMuseSocket() {
 
   const updateSettings = useCallback(async (patch: Record<string, string>) => {
     if (transportRef.current === 'cloud') {
+      // Never cache sensitive bridgeToken or ownerPasscode in browser localStorage
+      const { bridgeToken: _bt, ownerPasscode: _op, ...llmOnly } = patch;
       const existing = loadJsonStorage<Record<string, string>>(CLOUD_SETTINGS_KEY) || {};
-      saveJsonStorage(CLOUD_SETTINGS_KEY, { ...existing, ...patch });
+      saveJsonStorage(CLOUD_SETTINGS_KEY, { ...existing, ...llmOnly });
     }
     const res = await apiJson<{ settings: PublicSettings }>('/api/settings', {
       method: 'POST',
       body: JSON.stringify(patch),
-    });
+    }).catch(handleAuthGuard);
     if (transportRef.current === 'cloud' && res.settings) {
       setSettings(res.settings);
     }
@@ -480,7 +607,7 @@ export function useMuseSocket() {
   const clearHistory = useCallback(async () => {
     const res = await apiJson<{ ok: boolean; snapshot?: WorkspaceSnapshot }>('/api/missions/clear', {
       method: 'POST',
-    });
+    }).catch(handleAuthGuard);
     if (transportRef.current === 'cloud') {
       setMissions([]);
       setTasks([]);
@@ -490,7 +617,24 @@ export function useMuseSocket() {
     return res;
   }, []);
 
+  const resetWorkspace = useCallback(async () => {
+    const res = await apiJson<{ ok: boolean; snapshot?: WorkspaceSnapshot }>(
+      '/api/workspace/reset',
+      { method: 'POST' }
+    ).catch(handleAuthGuard);
+    if (transportRef.current === 'cloud') {
+      removeStorage(CLOUD_CACHE_KEY);
+    }
+    if (res.snapshot) {
+      applySnapshot(res.snapshot);
+    }
+    return res;
+  }, [applySnapshot]);
+
   return {
+    authStatus,
+    authError,
+    isServerless,
     connected,
     transportMode,
     agents,
@@ -499,6 +643,8 @@ export function useMuseSocket() {
     comms,
     beams,
     settings,
+    login,
+    logout,
     launchMission,
     createAgent,
     updateAgent,
@@ -508,5 +654,6 @@ export function useMuseSocket() {
     triggerAllHands,
     updateSettings,
     clearHistory,
+    resetWorkspace,
   };
 }

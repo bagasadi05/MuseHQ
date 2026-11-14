@@ -1,12 +1,15 @@
-import { useState } from 'react';
+import React, { useState } from 'react';
 import {
   Bot,
   Cpu,
   KeyRound,
+  Lock,
+  LogOut,
   PanelRightClose,
   PanelRightOpen,
   Plug,
   Plus,
+  ShieldCheck,
   Wifi,
   WifiOff,
 } from 'lucide-react';
@@ -22,6 +25,9 @@ import { LLMProvider, Mission } from './types';
 
 export default function App() {
   const {
+    authStatus,
+    authError,
+    isServerless,
     connected,
     transportMode,
     agents,
@@ -30,6 +36,8 @@ export default function App() {
     comms,
     beams,
     settings,
+    login,
+    logout,
     launchMission,
     createAgent,
     updateAgent,
@@ -39,7 +47,11 @@ export default function App() {
     triggerAllHands,
     updateSettings,
     clearHistory,
+    resetWorkspace,
   } = useMuseSocket();
+
+  const [passcodeInput, setPasscodeInput] = useState('');
+  const [loggingIn, setLoggingIn] = useState(false);
 
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [panelOpen, setPanelOpen] = useState(true);
@@ -58,6 +70,20 @@ export default function App() {
   const showError = (msg: string) => {
     setToastError(msg);
     setTimeout(() => setToastError(null), 4000);
+  };
+
+  const handleLoginSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!passcodeInput.trim() || loggingIn) return;
+    setLoggingIn(true);
+    try {
+      await login(passcodeInput.trim());
+      setPasscodeInput('');
+    } catch {
+      // authError state displayed below input
+    } finally {
+      setLoggingIn(false);
+    }
   };
 
   const handleLaunchMission = async (prompt: string, targetId: string) => {
@@ -82,6 +108,95 @@ export default function App() {
           ? 'OpenAI API'
           : 'Claude API';
 
+  if (authStatus !== 'authenticated') {
+    return (
+      <div className="flex h-screen w-screen items-center justify-center bg-slate-950 p-4 text-slate-100">
+        <div className="w-full max-w-md rounded-2xl border border-slate-800 bg-slate-900/95 p-6 shadow-2xl">
+          <div className="mb-4 flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-amber-400 to-orange-500 text-slate-950 shadow-lg shadow-amber-500/20">
+              <Bot className="h-5 w-5" />
+            </div>
+            <div>
+              <h1 className="font-display text-base font-bold text-white">MuseHQ Virtual Office</h1>
+              <p className="text-xs text-slate-400">Akses Ruangan Terproteksi Pemilik</p>
+            </div>
+          </div>
+
+          {authStatus === 'checking' && (
+            <div className="py-6 text-center text-xs text-slate-400">
+              Memeriksa sesi autentikasi...
+            </div>
+          )}
+
+          {authStatus === 'setup-required' && (
+            <div className="space-y-3 rounded-xl border border-amber-500/35 bg-amber-500/10 p-4 text-xs text-amber-100">
+              <div className="font-semibold text-amber-300">
+                Konfigurasi Keamanan Server Diperlukan
+              </div>
+              <p className="leading-relaxed text-amber-200/90">
+                Server {isServerless ? 'serverless Vercel' : 'Node'} berjalan tanpa{' '}
+                <code className="font-mono">MUSE_OWNER_PASSCODE</code>. Tambahkan environment
+                variable berikut di Vercel Project Settings (atau <code className="font-mono">server/.env</code>) lalu redeploy:
+              </p>
+              <pre className="overflow-x-auto rounded-lg bg-slate-950 p-2.5 font-mono text-[11px] text-slate-200">
+{`MUSE_OWNER_PASSCODE=<passcode-rahasia-kamu>
+BOT_BRIDGE_TOKEN=<token-acak-bridge-kamu>
+SESSION_SECRET=<string-acak-32-karakter>`}
+              </pre>
+            </div>
+          )}
+
+          {authStatus === 'locked' && (
+            <form onSubmit={handleLoginSubmit} className="space-y-3.5 text-xs">
+              <p className="leading-relaxed text-slate-300">
+                State ruangan kerja dan komunikasi bot dilindungi sesi pemilik. Masukkan{' '}
+                <code className="font-mono text-amber-300">MUSE_OWNER_PASSCODE</code> untuk
+                membuka kantor virtual.
+              </p>
+
+              <div>
+                <label className="mb-1.5 flex items-center gap-1.5 font-medium text-slate-300">
+                  <Lock className="h-3.5 w-3.5 text-amber-400" />
+                  <span>Owner Passcode</span>
+                </label>
+                <input
+                  type="password"
+                  required
+                  autoFocus
+                  value={passcodeInput}
+                  onChange={(e) => setPasscodeInput(e.target.value)}
+                  placeholder="Masukkan owner passcode..."
+                  className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2.5 font-mono text-xs text-slate-100 outline-none focus:border-amber-500"
+                />
+              </div>
+
+              {authError && (
+                <div className="rounded-lg border border-rose-500/40 bg-rose-950/40 px-3 py-2 text-rose-200">
+                  {authError}
+                </div>
+              )}
+
+              <button
+                type="submit"
+                disabled={!passcodeInput.trim() || loggingIn}
+                className="flex w-full items-center justify-center gap-1.5 rounded-xl bg-amber-500 px-4 py-2.5 text-xs font-semibold text-slate-950 transition hover:bg-amber-400 disabled:opacity-50 cursor-pointer"
+              >
+                <ShieldCheck className="h-4 w-4" />
+                <span>{loggingIn ? 'Memverifikasi...' : 'Buka MuseHQ'}</span>
+              </button>
+
+              <p className="text-[11px] leading-relaxed text-slate-500">
+                Menjalankan secara lokal pertama kali? Cek terminal server{' '}
+                <code className="font-mono">npm run dev</code> atau file{' '}
+                <code className="font-mono">server/.env</code>.
+              </p>
+            </form>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-slate-950 text-slate-100">
       {/* Top Studio Header */}
@@ -92,9 +207,7 @@ export default function App() {
           </div>
           <div>
             <div className="flex items-center gap-2">
-              <h1 className="font-display text-sm font-bold tracking-tight text-white">
-                MuseHQ
-              </h1>
+              <h1 className="font-display text-sm font-bold tracking-tight text-white">MuseHQ</h1>
               <span className="rounded-md border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 font-mono text-[10px] font-medium text-amber-300">
                 VIRTUAL OFFICE
               </span>
@@ -157,6 +270,16 @@ export default function App() {
           >
             <KeyRound className="h-3.5 w-3.5 text-amber-300" />
             <span className="hidden md:inline">API Keys</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => void logout()}
+            className="rounded-lg border border-slate-700 bg-slate-800/80 p-1.5 text-slate-300 transition hover:bg-slate-700 hover:text-amber-300 cursor-pointer"
+            title="Kunci sesi ruangan"
+            aria-label="Kunci sesi"
+          >
+            <LogOut className="h-4 w-4" />
           </button>
 
           <button
@@ -230,6 +353,9 @@ export default function App() {
               onClearHistory={async () => {
                 await clearHistory();
               }}
+              onResetWorkspace={async () => {
+                await resetWorkspace();
+              }}
             />
           </div>
         )}
@@ -247,7 +373,7 @@ export default function App() {
 
       <BridgeModal
         open={showBridge}
-        bridgeToken={settings.bridgeToken}
+        bridgeTokenPreview={settings.bridgeTokenPreview}
         agents={agents}
         onClose={() => setShowBridge(false)}
       />

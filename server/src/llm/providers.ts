@@ -196,7 +196,7 @@ function buildDemoPlan(lead: Agent, prompt: string, roster: Agent[]): LeadPlanRe
     });
   }
 
-  for (const extra of extras.slice(0, 3)) {
+  for (const extra of extras) {
     delegations.push({
       toAgentId: extra.id,
       title: `Kontribusi Spesialis: ${extra.role}`,
@@ -247,7 +247,7 @@ function buildDemoWork(agent: Agent, title: string, instructions: string, depCon
           `**Tugas:** ${title}`,
           '',
           '- **Arsitektur Inti:** Event-driven Orchestrator + WebSocket state broadcast (`agent:updated`, `task:updated`, `comms:message`).',
-          '- **Konektor Eksternal:** Endpoint REST `POST /api/tasks/:id/complete` dan WebSocket `/ws/bot` untuk bot Python/Node/n8n.',
+          '- **Konektor Eksternal:** Endpoint REST `POST /api/bridge/bots/:id/event` (`task:complete`) dan WebSocket `/ws/bot` untuk bot Python/Node/n8n.',
           '- **Skema Eksekusi:** DAG dependency resolver memastikan tugas dependen otomatis jalan tepat setelah prasyaratnya beres.',
         ].join('\n'),
       };

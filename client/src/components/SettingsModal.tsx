@@ -26,9 +26,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [geminiModel, setGeminiModel] = useState(settings.geminiModel);
   const [openaiModel, setOpenaiModel] = useState(settings.openaiModel);
   const [anthropicModel, setAnthropicModel] = useState(settings.anthropicModel);
-  const [bridgeToken, setBridgeToken] = useState(settings.bridgeToken);
+  const [bridgeToken, setBridgeToken] = useState('');
+  const [ownerPasscode, setOwnerPasscode] = useState('');
   const [applyAll, setApplyAll] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -36,10 +38,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setGeminiModel(settings.geminiModel);
     setOpenaiModel(settings.openaiModel);
     setAnthropicModel(settings.anthropicModel);
-    setBridgeToken(settings.bridgeToken);
+    setBridgeToken('');
+    setOwnerPasscode('');
     setGeminiApiKey('');
     setOpenaiApiKey('');
     setAnthropicApiKey('');
+    setErrorMsg(null);
   }, [open, settings]);
 
   if (!open) return null;
@@ -47,23 +51,27 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setSaving(true);
+    setErrorMsg(null);
     try {
       const patch: Record<string, string> = {
         defaultProvider,
         geminiModel,
         openaiModel,
         anthropicModel,
-        bridgeToken,
       };
       if (geminiApiKey.trim()) patch.geminiApiKey = geminiApiKey.trim();
       if (openaiApiKey.trim()) patch.openaiApiKey = openaiApiKey.trim();
       if (anthropicApiKey.trim()) patch.anthropicApiKey = anthropicApiKey.trim();
+      if (bridgeToken.trim()) patch.bridgeToken = bridgeToken.trim();
+      if (ownerPasscode.trim()) patch.ownerPasscode = ownerPasscode.trim();
 
       await onSaveSettings(patch);
       if (applyAll && agents.length > 0) {
         await onApplyProviderToAll(defaultProvider);
       }
       onClose();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Gagal menyimpan pengaturan');
     } finally {
       setSaving(false);
     }
@@ -76,7 +84,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           <div className="flex items-center gap-2">
             <KeyRound className="h-4 w-4 text-amber-400" />
             <h2 className="font-display text-sm font-bold text-slate-100">
-              Konfigurasi Cloud LLM & API Keys
+              Konfigurasi Cloud LLM & Keamanan
             </h2>
           </div>
           <button
@@ -90,9 +98,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
         <form onSubmit={handleSubmit} className="space-y-3.5 p-5 text-xs">
           <div>
-            <label className="mb-1 block font-medium text-slate-300">
-              Provider AI Default
-            </label>
+            <label className="mb-1 block font-medium text-slate-300">Provider AI Default</label>
             <select
               value={defaultProvider}
               onChange={(e) => setDefaultProvider(e.target.value as LLMProvider)}
@@ -188,15 +194,42 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
           </div>
 
-          <div>
-            <label className="mb-1 block text-slate-400">Token Keamanan External Bot Bridge</label>
-            <input
-              type="text"
-              value={bridgeToken}
-              onChange={(e) => setBridgeToken(e.target.value)}
-              className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-1.5 font-mono text-slate-200 outline-none"
-            />
+          <div className="grid grid-cols-2 gap-3 rounded-xl border border-slate-800 bg-slate-950/60 p-3">
+            <div>
+              <div className="mb-1 flex items-center justify-between">
+                <label className="text-slate-300">Ganti BOT_BRIDGE_TOKEN</label>
+                {settings.hasBridgeToken && (
+                  <span className="font-mono text-[10px] text-emerald-400">
+                    {settings.bridgeTokenPreview}
+                  </span>
+                )}
+              </div>
+              <input
+                type="password"
+                value={bridgeToken}
+                onChange={(e) => setBridgeToken(e.target.value)}
+                placeholder="Isi token baru (min 8 karakter)..."
+                className="w-full rounded-lg border border-slate-700 bg-slate-900 px-2.5 py-1.5 font-mono text-slate-200 outline-none focus:border-amber-500"
+              />
+            </div>
+
+            <div>
+              <label className="mb-1 block text-slate-300">Ganti Owner Passcode</label>
+              <input
+                type="password"
+                value={ownerPasscode}
+                onChange={(e) => setOwnerPasscode(e.target.value)}
+                placeholder="Kosongkan jika tetap..."
+                className="w-full rounded-lg border border-slate-700 bg-slate-900 px-2.5 py-1.5 font-mono text-slate-200 outline-none focus:border-amber-500"
+              />
+            </div>
           </div>
+
+          {errorMsg && (
+            <div className="rounded-lg border border-rose-500/40 bg-rose-950/40 px-3 py-2 text-rose-200">
+              {errorMsg}
+            </div>
+          )}
 
           <label className="flex items-center gap-2 text-slate-300 cursor-pointer">
             <input

@@ -1,50 +1,153 @@
-# MuseHQ — Multi-Agent Virtual Office untuk Bot Muse AI
+# MuseHQ — Multi-Agent Virtual Office & Orchestration Hub
 
-**MuseHQ** adalah aplikasi web ruangan kerja virtual 2D Isometric tempat berbagai bot Muse AI bekerja di meja masing-masing, berkomunikasi, saling memberi perintah, dan membagi tugas secara otomatis (paralel maupun bertahap).
+**MuseHQ** adalah aplikasi web ruang kerja virtual **2D Isometric** untuk menghubungkan, mengamati, dan mengorkestrasi bot internal maupun bot eksternal (**Muse AI**) di dalam satu kantor virtual yang interaktif.
 
-## Cara Kerja Arsitektur (3 Lapisan Utama)
+Di dalam MuseHQ, Anda (Commander / Pemilik) memberi misi lewat Command Bar, lalu `Muse Lead` memecah pekerjaan menjadi sub-tugas berbasis dependensi (**DAG**), mengirimkan pancaran perintah (*command beam*), membiarkan tugas independen berjalan paralel, menyalurkan hasil tugas pendahulu ke tugas dependen, dan menampilkan hasil akhir (*deliverables*) secara *real-time*.
 
-1. **Multi-Agent Orchestrator & Task Queue (`server/src/llm/orchestrator.ts`)**
-   - Saat kamu memberi satu perintah besar ke `@Muse Lead`, koordinator memecah perintah menjadi sub-tugas terstruktur lengkap dengan dependensi (`dependsOnTaskIds`).
-   - Tugas independen langsung dikerjakan paralel oleh bot terkait (`Muse Scout`, `Muse Dev`, dsb.), sedangkan tugas dependen (`Muse Craft`, `Muse Sentinel`) menunggu hasil tugas sebelumnya sebagai konteks.
+---
+
+## Arsitektur 3 Lapisan Utama
+
+1. **Multi-Agent Orchestrator & DAG Task Queue (`server/src/llm/orchestrator.ts`)**
+   - Menerima perintah pemilik (`@Muse Lead`, `@all`, atau langsung ke agen tertentu).
+   - Memecah misi menjadi graf sub-tugas dengan `dependsOnTaskIds`:
+     - Tugas tanpa dependensi langsung berstatus `working` / `assigned` dan berjalan **paralel**.
+     - Tugas dependen berstatus `waiting-dependency` hingga seluruh pendahulunya `completed`, lalu otomatis menerima ringkasan hasil pendahulu sebagai konteks eksekusi.
+   - Mendukung **Demo Simulator** maupun **Cloud LLM API** (`providers.ts`).
+
 2. **External Bot Bridge (`server/src/bridge/externalBridge.ts`)**
-   - Jalur **WebSocket** (`/ws/bot`) dan **REST Webhook** (`/api/bridge/*`) agar bot eksternal (script Node/Python, bot Telegram/Discord, atau n8n) bisa ikut masuk ke ruangan virtual, menerima tugas, dan mendelegasikan perintah ke bot lain.
+   - Menghubungkan bot nyata dari proses/mesin terpisah ke dalam ruangan yang sama melalui dua protokol:
+     - **WebSocket Bridge (`/ws/bot?token=<BOT_BRIDGE_TOKEN>`)** — koneksi *full-duplex* dua arah secara *real-time*.
+     - **REST Bridge & Polling (`/api/bridge/bots/:id/event`, `/api/bridge/bots/:id/events?since=`, `GET /api/state?since=`)** — aman untuk lingkungan serverless (seperti Vercel) atau skrip Python/Node/n8n/cron dengan deduplikasi berbasis `cursor` & `eventId`.
+   - Mendukung event tervalidasi: `bot:hello`, `bot:heartbeat`, `bot:status`, `bot:speech`, `bot:delegate`, `task:accept`, `task:complete`, `task:fail`, serta event keluar `task:assigned`, `comms:message`, `ping`.
+
 3. **2D Isometric Virtual Office UI (`client/src/components/OfficeCanvas.tsx`)**
-   - Menampilkan denah ruangan kantor virtual (Command Desk, Research Library, Engineering Bay, War Room, Creative Studio, QA & Bridge Lab, Coffee Lounge) lengkap dengan animasi karakter bot, *speech bubble*, dan pancaran garis perintah (*command beam*) secara *real-time*.
+   - Menampilkan denah kantor 2D isometric dengan **7 zona kanonik**:
+     - `command-desk` — **Command Desk**
+     - `research-library` — **Research Library**
+     - `engineering-bay` — **Engineering Bay**
+     - `war-room` — **War Room**
+     - `creative-studio` — **Creative Studio**
+     - `qa-bench` — **QA & Bridge Lab**
+     - `coffee-lounge` — **Coffee Lounge**
+   - Menampilkan karakter bot anti-tumpuk di meja masing-masing lengkap dengan nama, peran, warna, status (`idle`, `online`, `working`, `talking`, `offline`), *speech bubble*, *command beam*, daftar tugas, dan panel *deliverable*.
 
-## Menjalankan Project
+---
 
-1. Install seluruh dependencies (root, server, client):
+## Cara Install & Menjalankan (Lokal)
+
+1. Install seluruh dependencies (root, `server`, `client`):
    ```bash
    npm run install:all
    ```
-2. Jalankan backend & frontend sekaligus:
+2. *(Opsional)* Salin `.env.example` menjadi `server/.env` atau `.env` jika ingin mengatur token/passcode/API key secara manual:
+   ```bash
+   cp .env.example server/.env
+   ```
+   Jika `BOT_BRIDGE_TOKEN` dan `MUSE_OWNER_PASSCODE` tidak diisi saat run lokal pertama, server otomatis membuat kredensial acak ke `server/data/settings.json` dan mencetak **Owner Passcode** di log terminal server.
+3. Jalankan backend (port `3001`) dan frontend Vite (port `5173`) bersamaan:
    ```bash
    npm run dev
    ```
-3. Buka browser ke `http://localhost:5173`.
+4. Buka `http://localhost:5173` di browser, lalu masukkan **Owner Passcode** untuk membuka ruang kerja.
+
+Untuk build dan menjalankan mode produksi standalone Node:
+```bash
+npm run build
+npm start
+```
+
+---
 
 ## Mode AI yang Didukung
 
-- **Demo Simulator (Aktif Langsung):** Bisa langsung dicoba tanpa API Key untuk melihat alur delegasi, animasi ruangan, dan simulasi deliverable.
-- **Cloud LLM API:** Klik tombol **API Keys** di header web (atau isi `.env` dari `.env.example`) untuk memakai **Google Gemini**, **OpenAI**, atau **Anthropic Claude** di tiap bot.
+- **Demo Simulator (`DEFAULT_PROVIDER=demo`)**: Berjalan langsung tanpa API key apa pun. Cocok untuk menguji alur dekomposisi DAG, animasi ruangan, komunikasi tim, dan integrasi bot eksternal.
+- **Cloud LLM Asli (`gemini`, `openai`, `anthropic`)**:
+  - Atur langsung melalui menu **API Keys** di header UI (tersimpan aman di runtime settings / state lokal, tidak pernah diekspor mentah ke publik), **atau**
+  - Isi `DEFAULT_PROVIDER`, `GEMINI_API_KEY`, `OPENAI_API_KEY`, atau `ANTHROPIC_API_KEY` di `server/.env` / `.env`.
 
-## Deploy ke Vercel
+---
 
-Project ini sudah siap dideploy langsung ke **Vercel** melalui [vercel.json](vercel.json) dan serverless handler [api/index.mjs](api/index.mjs):
+## Menguji Bot Eksternal
 
-1. Import repository GitHub ini di dashboard Vercel (**Add New → Project**).
-2. Biarkan **Root Directory** di root (`.`), Vercel otomatis membaca `vercel.json` (`buildCommand: npm run build`, `outputDirectory: client/dist`).
-3. *(Opsional)* Tambahkan Environment Variables di Vercel:
-   - `DEFAULT_PROVIDER`: `gemini` / `openai` / `anthropic` / `demo`
-   - `GEMINI_API_KEY`, `OPENAI_API_KEY`, atau `ANTHROPIC_API_KEY`
-   - `BOT_BRIDGE_TOKEN`: token keamanan untuk REST Webhook bot eksternal
-4. Klik **Deploy**. Di Vercel, frontend otomatis memakai mode **Cloud Sync** (SSE real-time streaming + sinkronisasi state), dan bot eksternal dapat terhubung lewat **REST Webhook** (`/api/bridge/*`).
+Pastikan `npm run dev` sudah berjalan terlebih dahulu:
 
-## Menguji Bot Eksternal (`examples/external-bot.mjs`)
-
-Setelah `npm run dev` berjalan, buka terminal kedua lalu jalankan:
+### 1. Mode WebSocket (`examples/external-bot.mjs`)
+Di terminal kedua:
 ```bash
 npm run example:bot
 ```
-Bot eksternal baru (`Muse External Ops`) akan langsung masuk ke zona **QA & Bridge Lab** di kantor virtual dan siap menerima tugas dari `Muse Lead`!
+`Muse External Ops` (`muse-external-ops`) akan masuk ke zona **QA & Bridge Lab** (`qa-bench`), menyapa tim, lalu siap menerima tugas dari `Muse Lead` dan mengirim hasil kembali via `/ws/bot`.
+
+### 2. Mode REST Polling (`examples/rest-polling-bot.mjs`)
+```bash
+npm run example:rest-bot
+```
+`Muse REST Worker` (`muse-rest-worker`) mendaftar via `POST /api/bridge/bots/muse-rest-worker/event`, membaca `GET /api/state?since=<cursor>`, dan melaporkan hasil tanpa duplikasi saat polling diulang.
+
+### 3. Menghubungkan 4 Agen Rekan Nyata Sekaligus
+Keempat ID agen berikut diperlakukan sebagai **rekan setara** oleh `Muse Lead` (tidak dibatasi kuota delegasi):
+- `muse-bagas` (disarankan `homeZone: "command-desk"`)
+- `muse-arif` (mis. `research-library` / `engineering-bay`)
+- `muse-joni` (mis. `engineering-bay` / `creative-studio`)
+- `muse-niro` (mis. `qa-bench` / `war-room`)
+
+Setiap agen dapat dijalankan di mesin/proses berbeda dengan `BOT_ID` & `BOT_HOME_ZONE`:
+```bash
+BOT_ID=muse-bagas BOT_NAME="Muse Bagas" BOT_HOME_ZONE=command-desk BOT_BRIDGE_TOKEN="<TOKEN>" MUSE_WS_URL="wss://domain-anda.com/ws/bot" node examples/external-bot.mjs
+```
+
+---
+
+## Daftar Variabel Lingkungan (`.env`)
+
+| Variabel | Default | Fungsi |
+|---|---|---|
+| `PORT` | `3001` | Port server Express + WebSocket lokal |
+| `BOT_BRIDGE_TOKEN` | *(auto-random di lokal)* | Token rahasia untuk `/ws/bot` dan `/api/bridge/*` + `GET /api/state` bot |
+| `MUSE_OWNER_PASSCODE` | *(auto-random di lokal)* | Passcode pemilik untuk membuka UI web (`/api/auth/login`) |
+| `SESSION_SECRET` | *(auto-random / derivatif)* | Kunci penandatanganan cookie HMAC `muse_session` |
+| `ALLOWED_ORIGINS` | `localhost:5173,localhost:3001` | Daftar origin CORS yang diizinkan (pisahkan koma) |
+| `DEFAULT_PROVIDER` | `demo` | Provider default: `demo`, `gemini`, `openai`, atau `anthropic` |
+| `GEMINI_API_KEY` | — | API Key Google Gemini |
+| `GEMINI_MODEL` | `gemini-2.5-flash` | Model Gemini yang dipakai |
+| `OPENAI_API_KEY` | — | API Key OpenAI |
+| `OPENAI_MODEL` | `gpt-4o-mini` | Model OpenAI yang dipakai |
+| `ANTHROPIC_API_KEY` | — | API Key Anthropic Claude |
+| `ANTHROPIC_MODEL` | `claude-sonnet-4-5` | Model Claude yang dipakai |
+
+---
+
+## Model Keamanan
+
+- **Tanpa Token Publik Bawaan**: Nilai pengembangan lama sudah dipensiunkan dan ditolak aktif oleh server (`isRetiredToken`). Token acak dibuat otomatis pada run lokal pertama jika belum dikonfigurasi.
+- **Autentikasi Owner (`muse_session`)**: `GET /api/state`, seluruh mutasi misi/agen/pengaturan, dan upgrade `/ws/ui` dilindungi cookie sesi `HttpOnly` bertanda tangan HMAC (`POST /api/auth/login`). `GET /api/state` juga mendukung header `x-muse-token` khusus untuk bot polling REST.
+- **Proteksi Bridge & Validasi Ketat**: `/ws/bot` dan `/api/bridge/*` memeriksa token secara *constant-time*. Event tak dikenal ditolak dengan `400 Bad Request` (REST) atau pesan `error` (WebSocket) tanpa menjatuhkan server.
+- **Privasi Kredensial**: `bridgeToken` dan API key tidak pernah dikembalikan mentah dalam snapshot UI (`PublicSettings` hanya mengirim `bridgeTokenPreview`), tidak dicetak di log endpoint REST, dan tidak pernah ditulis ke kode contoh.
+- **CORS Terbatas**: Permintaan lintas-origin hanya diizinkan jika origin cocok dengan `ALLOWED_ORIGINS` atau domain deployment resmi.
+
+---
+
+## Deploy ke URL Publik (Agar Bot dari Mesin Lain Bisa Masuk)
+
+`localhost` hanya dapat dijangkau dari komputer yang sama. Agar bot di mesin lain (`muse-bagas`, `muse-arif`, `muse-joni`, `muse-niro`, server Telegram/Discord/n8n) bisa terhubung, deploy backend ke URL publik:
+
+### Opsi A — Server Node.js Selalu Menyala (Direkomendasikan untuk WebSocket `/ws/bot` Penuh)
+Cocok untuk **VPS (Ubuntu + Nginx/Caddy TLS), Railway, Render, atau Fly.io**:
+1. Build aplikasi: `npm run install:all && npm run build`.
+2. Atur environment variables:
+   - `BOT_BRIDGE_TOKEN` (token acak kuat)
+   - `MUSE_OWNER_PASSCODE` (passcode pemilik)
+   - `SESSION_SECRET` (string acak 32+ karakter)
+   - `ALLOWED_ORIGINS=https://domain-anda.com`
+3. Jalankan `npm start` (server melayani API, `/ws/ui`, `/ws/bot`, dan static bundle `client/dist`). State tersimpan persisten di disk (`server/data/state.json`).
+
+### Opsi B — Vercel Serverless + REST Bridge (`vercel.json` & `api/index.mjs`)
+Cocok untuk deployment cepat tanpa manage VPS:
+1. Import repository ke Vercel (`buildCommand: npm run build`, `outputDirectory: client/dist`).
+2. Wajib atur Environment Variables di Vercel (**Production & Preview**):
+   - `BOT_BRIDGE_TOKEN` (sensitif)
+   - `MUSE_OWNER_PASSCODE` (sensitif)
+   - `SESSION_SECRET` (sensitif — menjaga cookie sesi owner tetap valid lintas *cold start*)
+3. Di Vercel Serverless (tanpa WebSocket stateful jangka panjang), UI otomatis berjalan pada mode **Cloud Sync (SSE Streaming)** dan bot eksternal terhubung lewat **REST Polling** (`GET /api/state?since=` & `POST /api/bridge/bots/:id/event`).
+   - *Catatan Serverless:* Memori fungsi Lambda/Serverless bersifat sementara saat idle; gunakan Opsi A (Node persisten) jika Anda membutuhkan bot WebSocket tersambung terus-menerus dan persistensi file lokal tanpa database eksternal.

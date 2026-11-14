@@ -1,21 +1,24 @@
 import React, { useState } from 'react';
-import { Check, Copy, Plug, X } from 'lucide-react';
+import { Check, Copy, Plug, ShieldAlert, X } from 'lucide-react';
 import { Agent } from '../types';
 
 interface BridgeModalProps {
   open: boolean;
-  bridgeToken: string;
+  bridgeTokenPreview: string;
   agents: Agent[];
   onClose: () => void;
 }
 
+type GuideTab = 'ws' | 'rest' | 'peers';
+
 export const BridgeModal: React.FC<BridgeModalProps> = ({
   open,
-  bridgeToken,
+  bridgeTokenPreview,
   agents,
   onClose,
 }) => {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [tab, setTab] = useState<GuideTab>('ws');
   if (!open) return null;
 
   const isLocal =
@@ -23,24 +26,24 @@ export const BridgeModal: React.FC<BridgeModalProps> = ({
     (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
   const host = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
   const origin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3001';
-  const wsUrl = isLocal
-    ? `ws://${host}:3001/ws/bot?token=${bridgeToken}`
-    : `ws://localhost:3001/ws/bot?token=${bridgeToken}`;
-  const restUrl = isLocal ? `http://${host}:3001/api/bridge` : `${origin}/api/bridge`;
+  const wsBase = isLocal
+    ? `ws://${host}:3001/ws/bot`
+    : `${origin.replace(/^http/, 'ws')}/ws/bot`;
+  const apiBase = isLocal ? `http://${host}:3001/api` : `${origin}/api`;
 
-  const wsSnippet = `// Jalankan contoh bot eksternal langsung dari root project:
-// npm run example:bot
+  const wsSnippet = `// Jalankan contoh resmi langsung dari root repo:
+// BOT_BRIDGE_TOKEN=<token-dari-env> npm run example:bot
 
-import WebSocket from 'ws';
+const TOKEN = process.env.BOT_BRIDGE_TOKEN;
+const ws = new WebSocket('${wsBase}?token=' + encodeURIComponent(TOKEN));
 
-const ws = new WebSocket('${wsUrl}');
-ws.on('open', () => {
+ws.addEventListener('open', () => {
   ws.send(JSON.stringify({
     event: 'bot:hello',
     payload: {
-      id: 'muse-telegram-bot',
-      name: 'Muse Connector',
-      role: 'External Bot Specialist',
+      id: 'muse-external-ops',
+      name: 'Muse External Ops',
+      role: 'Automation & Integration Bot',
       homeZone: 'qa-bench',
       color: '#a855f7',
       canDelegate: true
@@ -48,32 +51,43 @@ ws.on('open', () => {
   }));
 });
 
-ws.on('message', (raw) => {
-  const { event, payload } = JSON.parse(raw.toString());
+ws.addEventListener('message', (evt) => {
+  const { event, payload } = JSON.parse(String(evt.data));
   if (event === 'task:assigned') {
-    // Kerjakan tugas lalu kirim hasilnya kembali ke ruangan:
     ws.send(JSON.stringify({
       event: 'task:complete',
       payload: {
         taskId: payload.taskId,
-        speech: 'Tugas dari bot eksternal selesai!',
-        result: 'Hasil proses dari script eksternal untuk: ' + payload.title
+        speech: 'Tugas eksternal selesai!',
+        result: 'Deliverable Markdown untuk ' + payload.title
       }
     }));
   }
 });`;
 
-  const restSnippet = `# 1. Daftarkan bot eksternal via REST
-curl -X POST ${restUrl}/register \\
+  const restSnippet = `# 1. Registrasi / Bot Hello via REST (jalur polling tanpa WebSocket)
+curl -X POST ${apiBase}/bridge/bots/muse-rest-scout/event \\
   -H "Content-Type: application/json" \\
-  -H "x-muse-token: ${bridgeToken}" \\
-  -d '{"name":"Muse n8n","role":"Automation Bot","homeZone":"qa-bench","webhookUrl":"http://localhost:5678/webhook/muse"}'
+  -H "x-muse-token: $BOT_BRIDGE_TOKEN" \\
+  -d '{"event":"bot:hello","payload":{"name":"Muse REST Scout","role":"Polling Specialist","homeZone":"qa-bench","canDelegate":false}}'
 
-# 2. Kirim event atau perintah antar-bot dari luar
-curl -X POST ${restUrl}/bots/muse-n8n/event \\
+# 2. Baca state ruangan atau poll event baru pakai cursor ?since=<seq>
+curl -H "x-muse-token: $BOT_BRIDGE_TOKEN" "${apiBase}/state?since=0"
+curl -H "x-muse-token: $BOT_BRIDGE_TOKEN" "${apiBase}/bridge/bots/muse-rest-scout/events?since=0"
+
+# 3. Kirim status / selesai tugas (sertakan eventId opsional untuk deduplikasi)
+curl -X POST ${apiBase}/bridge/bots/muse-rest-scout/event \\
   -H "Content-Type: application/json" \\
-  -H "x-muse-token: ${bridgeToken}" \\
-  -d '{"event":"task:delegate","payload":{"toAgentId":"muse-dev","title":"Sync DB","instructions":"Buat endpoint /sync"}}'`;
+  -H "x-muse-token: $BOT_BRIDGE_TOKEN" \\
+  -d '{"event":"task:complete","eventId":"done-1","payload":{"taskId":"task-id","speech":"Selesai!","result":"Laporan Markdown"}}'`;
+
+  const peersSnippet = `// Rekan setara yang tersambung ke MuseHQ via bot:hello:
+const REAL_AGENTS = [
+  { id: 'muse-bagas', name: 'Muse Bagas', role: 'Lead Architect (Owner Muse)', homeZone: 'command-desk', color: '#f59e0b', canDelegate: true },
+  { id: 'muse-arif',  name: 'Muse Arif',  role: 'Peer Specialist', homeZone: 'research-library', color: '#06b6d4', canDelegate: true },
+  { id: 'muse-joni',  name: 'Muse Joni',  role: 'Peer Engineer',   homeZone: 'engineering-bay',  color: '#10b981', canDelegate: true },
+  { id: 'muse-niro',  name: 'Muse Niro',  role: 'Peer Creative & QA', homeZone: 'creative-studio', color: '#ec4899', canDelegate: true },
+];`;
 
   const copyText = (key: string, text: string) => {
     navigator.clipboard.writeText(text);
@@ -103,11 +117,16 @@ curl -X POST ${restUrl}/bots/muse-n8n/event \\
         </div>
 
         <div className="flex-1 space-y-4 overflow-y-auto p-5 text-xs">
-          <p className="leading-relaxed text-slate-300">
-            Punya bot Muse AI yang jalan terpisah (script Python/Node, bot Discord/Telegram, atau
-            workflow n8n)? Sambungkan ke endpoint di bawah ini — karakter bot akan otomatis muncul
-            di kantor virtual dan bisa menerima maupun memberi perintah ke bot lain.
-          </p>
+          <div className="flex items-start gap-2.5 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-amber-200">
+            <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+            <div className="leading-relaxed">
+              Demi keamanan, nilai asli <code className="font-mono">BOT_BRIDGE_TOKEN</code>{' '}
+              ({bridgeTokenPreview || 'aktif di server'}) <strong>tidak ditampilkan di UI</strong>.
+              Baca dari file <code className="font-mono">server/.env</code>,{' '}
+              <code className="font-mono">server/data/settings.json</code>, atau Environment Variables
+              deployment kamu saat menjalankan bot eksternal.
+            </div>
+          </div>
 
           <div className="rounded-xl border border-slate-800 bg-slate-950 p-3">
             <div className="mb-1 text-[11px] font-semibold text-slate-400">
@@ -117,7 +136,7 @@ curl -X POST ${restUrl}/bots/muse-n8n/event \\
               <div className="text-slate-500">
                 Belum ada bot eksternal terhubung. Coba jalankan{' '}
                 <code className="rounded bg-slate-800 px-1.5 py-0.5 text-amber-300">
-                  npm run example:bot
+                  BOT_BRIDGE_TOKEN=&lt;token&gt; npm run example:bot
                 </code>{' '}
                 di terminal!
               </div>
@@ -134,66 +153,141 @@ curl -X POST ${restUrl}/bots/muse-n8n/event \\
                       }`}
                     />
                     <span className="font-semibold text-slate-200">{b.name}</span>
-                    <span className="text-slate-500">({b.type})</span>
+                    <span className="text-slate-500">
+                      ({b.id} • {b.type})
+                    </span>
                   </span>
                 ))}
               </div>
             )}
           </div>
 
-          <div>
-            <div className="mb-1.5 flex items-center justify-between">
-              <span className="font-semibold text-purple-300">
-                Opsi 1: Real-time WebSocket Bridge
-              </span>
-              <button
-                type="button"
-                onClick={() => copyText('ws', wsSnippet)}
-                className="flex items-center gap-1 rounded-md border border-slate-700 bg-slate-800 px-2 py-1 text-[11px] text-slate-200 hover:bg-slate-700 cursor-pointer"
-              >
-                {copiedKey === 'ws' ? (
-                  <>
-                    <Check className="h-3 w-3 text-emerald-400" />
-                    <span>Tersalin</span>
-                  </>
-                ) : (
-                  <>
-                    <Copy className="h-3 w-3" />
-                    <span>Salin Kode</span>
-                  </>
-                )}
-              </button>
-            </div>
-            <pre className="overflow-x-auto rounded-xl border border-slate-800 bg-slate-950 p-3 font-mono text-[11px] leading-relaxed text-slate-300">
-              {wsSnippet}
-            </pre>
+          {/* Protocol Tabs */}
+          <div className="flex gap-1.5 border-b border-slate-800 pb-2">
+            <button
+              type="button"
+              onClick={() => setTab('ws')}
+              className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition cursor-pointer ${
+                tab === 'ws'
+                  ? 'bg-purple-500/20 text-purple-200 border border-purple-500/40'
+                  : 'text-slate-400 hover:bg-slate-800'
+              }`}
+            >
+              WebSocket (/ws/bot)
+            </button>
+            <button
+              type="button"
+              onClick={() => setTab('rest')}
+              className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition cursor-pointer ${
+                tab === 'rest'
+                  ? 'bg-sky-500/20 text-sky-200 border border-sky-500/40'
+                  : 'text-slate-400 hover:bg-slate-800'
+              }`}
+            >
+              REST Polling (/api/bridge)
+            </button>
+            <button
+              type="button"
+              onClick={() => setTab('peers')}
+              className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition cursor-pointer ${
+                tab === 'peers'
+                  ? 'bg-amber-500/20 text-amber-200 border border-amber-500/40'
+                  : 'text-slate-400 hover:bg-slate-800'
+              }`}
+            >
+              Agen Rekan (Bagas/Arif/Joni/Niro)
+            </button>
           </div>
 
-          <div>
-            <div className="mb-1.5 flex items-center justify-between">
-              <span className="font-semibold text-sky-300">Opsi 2: REST Webhook / HTTP API</span>
-              <button
-                type="button"
-                onClick={() => copyText('rest', restSnippet)}
-                className="flex items-center gap-1 rounded-md border border-slate-700 bg-slate-800 px-2 py-1 text-[11px] text-slate-200 hover:bg-slate-700 cursor-pointer"
-              >
-                {copiedKey === 'rest' ? (
-                  <>
-                    <Check className="h-3 w-3 text-emerald-400" />
-                    <span>Tersalin</span>
-                  </>
-                ) : (
-                  <>
-                    <Copy className="h-3 w-3" />
-                    <span>Salin cURL</span>
-                  </>
-                )}
-              </button>
+          {tab === 'ws' && (
+            <div>
+              <div className="mb-1.5 flex items-center justify-between">
+                <span className="font-semibold text-purple-300">
+                  Jalur Utama: Real-time WebSocket Bridge
+                </span>
+                <button
+                  type="button"
+                  onClick={() => copyText('ws', wsSnippet)}
+                  className="flex items-center gap-1 rounded-md border border-slate-700 bg-slate-800 px-2 py-1 text-[11px] text-slate-200 hover:bg-slate-700 cursor-pointer"
+                >
+                  {copiedKey === 'ws' ? (
+                    <>
+                      <Check className="h-3 w-3 text-emerald-400" />
+                      <span>Tersalin</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="h-3 w-3" />
+                      <span>Salin Kode</span>
+                    </>
+                  )}
+                </button>
+              </div>
+              <pre className="overflow-x-auto rounded-xl border border-slate-800 bg-slate-950 p-3 font-mono text-[11px] leading-relaxed text-slate-300">
+                {wsSnippet}
+              </pre>
             </div>
-            <pre className="overflow-x-auto rounded-xl border border-slate-800 bg-slate-950 p-3 font-mono text-[11px] leading-relaxed text-slate-300">
-              {restSnippet}
-            </pre>
-          </div>
+          )}
+
+          {tab === 'rest' && (
+            <div>
+              <div className="mb-1.5 flex items-center justify-between">
+                <span className="font-semibold text-sky-300">
+                  Jalur Cadangan: REST Polling (atau jalankan npm run example:rest-bot)
+                </span>
+                <button
+                  type="button"
+                  onClick={() => copyText('rest', restSnippet)}
+                  className="flex items-center gap-1 rounded-md border border-slate-700 bg-slate-800 px-2 py-1 text-[11px] text-slate-200 hover:bg-slate-700 cursor-pointer"
+                >
+                  {copiedKey === 'rest' ? (
+                    <>
+                      <Check className="h-3 w-3 text-emerald-400" />
+                      <span>Tersalin</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="h-3 w-3" />
+                      <span>Salin cURL</span>
+                    </>
+                  )}
+                </button>
+              </div>
+              <pre className="overflow-x-auto rounded-xl border border-slate-800 bg-slate-950 p-3 font-mono text-[11px] leading-relaxed text-slate-300">
+                {restSnippet}
+              </pre>
+            </div>
+          )}
+
+          {tab === 'peers' && (
+            <div>
+              <div className="mb-1.5 flex items-center justify-between">
+                <span className="font-semibold text-amber-300">
+                  Preset ID Rekan Nyata di MuseHQ
+                </span>
+                <button
+                  type="button"
+                  onClick={() => copyText('peers', peersSnippet)}
+                  className="flex items-center gap-1 rounded-md border border-slate-700 bg-slate-800 px-2 py-1 text-[11px] text-slate-200 hover:bg-slate-700 cursor-pointer"
+                >
+                  {copiedKey === 'peers' ? (
+                    <>
+                      <Check className="h-3 w-3 text-emerald-400" />
+                      <span>Tersalin</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="h-3 w-3" />
+                      <span>Salin Preset</span>
+                    </>
+                  )}
+                </button>
+              </div>
+              <pre className="overflow-x-auto rounded-xl border border-slate-800 bg-slate-950 p-3 font-mono text-[11px] leading-relaxed text-slate-300">
+                {peersSnippet}
+              </pre>
+            </div>
+          )}
         </div>
       </div>
     </div>
