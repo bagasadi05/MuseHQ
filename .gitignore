@@ -10,3 +10,7 @@ server/data/
 *.log
 *.tsbuildinfo
 package-lock.json
+examples/.mailbox/
+examples/inbox/
+examples/outbox/
+examples/state.json
